@@ -24,7 +24,7 @@ Panel {
   ipcTarget: "io.github.lcorneliussen.omaego"
 
   readonly property string omaego: setting("command", "omaego")
-  readonly property bool showWhenEmpty: setting("showWhenEmpty", false) === true
+  readonly property bool hideWhenEmpty: setting("hideWhenEmpty", false) === true
   readonly property int pollSeconds: Math.max(1, setting("pollSeconds", 3))
 
   property var model: ({ egos: [], rules: [] })
@@ -32,16 +32,23 @@ Panel {
   readonly property var rules: model.rules || []
   readonly property var hereEgos: egos.filter(function (e) { return e.here })
   readonly property bool mixed: hereEgos.length > 1
-  readonly property string label: hereEgos.length
-    ? hereEgos.map(function (e) { return e.name }).join(" | ") : "—"
+  // One ego owns a workspace in the normal case; more than one is worth naming
+  // as such rather than listing, which would make the bar jump around in width.
+  readonly property string label: hereEgos.length === 0 ? ""
+    : hereEgos.length === 1 ? hereEgos[0].name : "mixed"
+  readonly property real iconPx: Math.max(10, Math.round(barSize * 0.52))
+  readonly property real ringPx: Math.max(1, Math.round(iconPx * 0.1))
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(fg, 1.6)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  visible: hereEgos.length > 0 || showWhenEmpty
-  implicitWidth: vertical ? barSize : labelText.implicitWidth + Style.space(14)
-  implicitHeight: vertical ? labelText.implicitHeight + Style.space(14) : barSize
+  // Always visible by default: the widget is the only way into the panel, and
+  // an empty workspace is exactly when you want it (to start an ego here).
+  // Hiding it then made the widget look broken.
+  visible: hereEgos.length > 0 || !hideWhenEmpty
+  implicitWidth: vertical ? barSize : content.implicitWidth + Style.space(14)
+  implicitHeight: vertical ? content.implicitHeight + Style.space(14) : barSize
   readonly property bool vertical: bar ? bar.vertical : false
   readonly property int barSize: bar ? bar.barSize : Style.bar.sizeHorizontal
 
@@ -72,14 +79,55 @@ Panel {
     onTriggered: root.refresh()
   }
 
-  Text {
-    id: labelText
+  Row {
+    id: content
     anchors.centerIn: parent
-    text: root.label
-    font.family: root.fontFamily
-    color: root.mixed && root.bar ? root.bar.urgent : root.fg
-    opacity: root.hereEgos.length ? 1.0 : 0.45
-    rotation: root.vertical ? 90 : 0
+    spacing: root.label === "" ? 0 : Style.space(5)
+
+    // Two-faced mark: half light, half dark, drawn rather than taken from a
+    // glyph because no Nerd Font carries one. The ring keeps the dark half
+    // readable on a dark bar, where a literal black fill would disappear.
+    Item {
+      id: mark
+      width: root.iconPx
+      height: root.iconPx
+      anchors.verticalCenter: parent.verticalCenter
+      opacity: root.hereEgos.length ? 1.0 : 0.55
+
+      Rectangle {
+        anchors.fill: parent
+        radius: width / 2
+        color: "#000000"
+      }
+      Item {
+        width: parent.width / 2
+        height: parent.height
+        clip: true
+        Rectangle {
+          width: mark.width
+          height: mark.height
+          radius: mark.width / 2
+          color: "#ffffff"
+        }
+      }
+      Rectangle {
+        anchors.fill: parent
+        radius: width / 2
+        color: "transparent"
+        border.width: root.ringPx
+        border.color: "#ffffff"
+      }
+    }
+
+    Text {
+      id: labelText
+      visible: root.label !== "" && !root.vertical
+      anchors.verticalCenter: parent.verticalCenter
+      text: root.label
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      color: root.mixed && root.bar ? root.bar.urgent : root.fg
+    }
   }
   MouseArea {
     id: button

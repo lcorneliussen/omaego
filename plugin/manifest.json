@@ -19,15 +19,15 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "showWhenEmpty": false,
       "pollSeconds": 3,
-      "command": "omaego"
+      "command": "omaego",
+      "hideWhenEmpty": false
     },
     "schema": [
       {
-        "key": "showWhenEmpty",
+        "key": "hideWhenEmpty",
         "type": "boolean",
-        "label": "Keep the widget visible on workspaces with no ego"
+        "label": "Hide the widget on workspaces with no ego"
       },
       {
         "key": "pollSeconds",
