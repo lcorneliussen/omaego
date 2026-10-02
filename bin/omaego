@@ -612,11 +612,17 @@ def highlight(mode=None):
         if not (cls.startswith("chrome-") or cls == "google-chrome"):
             continue
         colour = want.get(c["address"])
-        value = f"rgb({colour})" if colour else "unset"
-        for prop in ("active_border_color", "inactive_border_color"):
-            cmds.append(f"dispatch hl.dsp.window.set_prop({{ window = "
-                        f"'address:{c['address']}', prop = '{prop}', "
-                        f"value = '{value}' }})")
+        # Only the INACTIVE colour. Setting the active one too made a focused
+        # window look exactly like an unfocused one, which is Hyprland's own
+        # way of showing focus - the highlight was overwriting it.
+        #
+        # And the reset value is 0, not "unset": "unset" and -1 both report ok
+        # and change nothing, so every clear was silently a no-op and the
+        # borders stayed after the panel closed.
+        value = f"'rgb({colour})'" if colour else "0"
+        cmds.append(f"dispatch hl.dsp.window.set_prop({{ window = "
+                    f"'address:{c['address']}', prop = 'inactive_border_color', "
+                    f"value = {value} }})")
     if cmds:
         subprocess.run(["hyprctl", "--batch", " ; ".join(cmds)], capture_output=True)
 
