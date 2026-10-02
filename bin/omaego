@@ -837,6 +837,85 @@ WEBAPPS = {
 }
 
 
+def ego_initials(name):
+    """One to three letters for the badge: short all-caps names stay whole."""
+    words = [w for w in re.split(r"[^A-Za-z0-9]+", name) if w]
+    if not words:
+        return "?"
+    if len(words) == 1:
+        w = words[0]
+        return w.upper() if (w.isupper() and len(w) <= 3) else w[:2].upper()
+    return (words[0][0] + words[1][0]).upper()
+
+
+def readable_on(hex_colour):
+    """Black or white, whichever reads on that background."""
+    h = hex_colour.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return "#000000" if lum > 0.55 else "#ffffff"
+
+
+def badge_icon(path, text, colour):
+    """See apply_badge; this does the drawing."""
+    """Stamp an ego badge onto the bottom-right of a 256px app icon.
+
+    Two egos running the same web app otherwise produce identical launcher
+    icons, which is exactly the confusion omaego exists to prevent.
+    """
+    if not shutil.which("magick") or not path.exists():
+        return False
+    colour = "#" + colour.lstrip("#")
+    fg = readable_on(colour)
+    tmp = path.with_suffix(".badge.png")
+    try:
+        # the disc, with a dark rim so it separates from any artwork beneath
+        subprocess.run(["magick", "-size", "128x128", "xc:none",
+                        "-fill", colour, "-stroke", "#00000066", "-strokewidth", "6",
+                        "-draw", "circle 64,64 64,8", str(tmp)], check=True,
+                       capture_output=True)
+        # the letters, trimmed then fitted inside the disc
+        label = path.with_suffix(".txt.png")
+        font = subprocess.run(["fc-match", "-f", "%{file}", "DejaVu Sans:bold"],
+                              capture_output=True, text=True).stdout.strip()
+        args = ["magick", "-background", "none", "-fill", fg]
+        if font:
+            args += ["-font", font]
+        args += ["-pointsize", "96", f"label:{text}", "-trim", "+repage",
+                 "-resize", "64x52", str(label)]
+        subprocess.run(args, check=True, capture_output=True)
+        subprocess.run(["magick", str(tmp), str(label), "-gravity", "center",
+                        "-composite", str(tmp)], check=True, capture_output=True)
+        subprocess.run(["magick", str(path), "-resize", "256x256",
+                        str(tmp), "-gravity", "southeast", "-geometry", "+4+4",
+                        "-composite", f"PNG32:{path}"], check=True, capture_output=True)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+    finally:
+        for f in (tmp, path.with_suffix(".txt.png")):
+            f.unlink(missing_ok=True)
+
+
+def apply_badge(icon_slug, ego):
+    """Stamp the ego badge, always from the pristine copy.
+
+    The unbadged original is kept beside it, so re-badging after an ego is
+    renamed or recoloured never stacks one disc on top of another.
+    """
+    if os.environ.get("OMAEGO_NO_BADGE") == "1":
+        return False
+    icon = ICON_DIR / f"{icon_slug}.png"
+    orig = ICON_DIR / f"{icon_slug}.orig.png"
+    if not icon.exists() and not orig.exists():
+        return False
+    if orig.exists():
+        shutil.copy(orig, icon)
+    else:
+        shutil.copy(icon, orig)
+    return badge_icon(icon, ego_initials(ego["name"]), ego_color(ego["slug"]))
+
+
 def normalize_icon(path):
     """Make an icon a 256px transparent PNG, whatever the site served.
 
@@ -1062,6 +1141,7 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
             continue
         if not icon_arg:                       # omarchy fetched it; fix it up
             normalize_icon(ICON_DIR / f"{icon_slug}.png")
+        apply_badge(icon_slug, ego)
         print(f"  installed  {name}")
         notify(f"added {name} — find it in the launcher")
 
@@ -1109,6 +1189,7 @@ opens on the workspace you are on - never by switching desktops.
                          either one is enough; you are asked for the other
   omaego app remove <ego> <app>...
   omaego app icon <ego> "<app name>" <image url|path|--agent>
+  omaego app rebadge [ego]        stamp ego badges on installed app icons
   omaego launch <slug> [url]
   omaego default [slug]  show/set the FALLBACK ego: the one that owns plain
                          "Google Chrome" and web apps. Not an "active" ego -
@@ -1375,6 +1456,7 @@ def main(argv):
             print("  omaego app add <ego> --url <url> --name <name>")
             print("  omaego app remove <ego> <app>...")
             print('  omaego app icon <ego> "<app name>" <image url|path|--agent>')
+            print("  omaego app rebadge [ego]        stamp ego badges on icons")
             print("\n[rule] marks a host one ego can plausibly own outright; "
                   "--rule writes it.\nHosts without it are shared between egos "
                   "(Teams, Outlook, Gmail, Meet) — a rule\nthere would send a "
@@ -1417,6 +1499,8 @@ def main(argv):
                 print(f"could not use {src}", file=sys.stderr)
                 notify(f"could not use that image for {app['name']}")
                 return 1
+            (ICON_DIR / f"{icon_slug}.orig.png").unlink(missing_ok=True)
+            apply_badge(icon_slug, profiles()[slug])
             d = DESKTOP_DIR / app["desktop"]
             d.write_text(re.sub(r"^Icon=.*$", f"Icon={icon_slug}", d.read_text(),
                                 flags=re.M))
@@ -1427,6 +1511,25 @@ def main(argv):
                            capture_output=True)
             print(f"  {app['name']}: icon set from {src}")
             notify(f"{app['name']}: icon updated")
+            return 0
+
+        if sub == "rebadge":
+            which = argv[2] if len(argv) > 2 else None
+            egos = profiles()
+            n = 0
+            for slug, apps in sorted(installed_apps().items()):
+                if (which and slug != which) or slug not in egos:
+                    continue
+                for a in apps:
+                    icon = a["icon"]
+                    if not icon or "/" in icon:
+                        continue
+                    if apply_badge(icon, egos[slug]):
+                        print(f"  {a['name']}"); n += 1
+            subprocess.run(["gtk-update-icon-cache",
+                            str(Path.home() / ".local/share/icons/hicolor")],
+                           capture_output=True)
+            print(f"{n} icon(s) badged")
             return 0
 
         if sub == "installed":
