@@ -396,6 +396,25 @@ def launch(target, url=None, new_window=False, incognito=False, as_app=False):
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def ego_options(by_class, first=()):
+    """Picker rows: every ego, with the ones on this desktop at the top."""
+    here_first = [t for c, t in sorted(by_class.items()) if c in first]
+    rest = [t for c, t in sorted(by_class.items()) if c not in first]
+    rows = [(t["name"], t) for t in here_first + rest]
+    rows.append(("+ New ego…", "__new__"))
+    return rows
+
+
+def resolve_choice(chosen):
+    """Turn a picker result into a target, creating an ego if asked."""
+    if chosen != "__new__":
+        return chosen
+    name = prompt_text("Name for the new ego")
+    if not name:
+        return None
+    return profiles()[add_profile(name)]
+
+
 def open_url(url=None, incognito=False):
     by_class = all_targets()
     if any(t["managed"] for t in by_class.values()):
@@ -433,26 +452,26 @@ def open_url(url=None, incognito=False):
         elif len(distinct) == 1:
             target = by_class[distinct.pop()]
         else:
-            target = pick([(by_class[c]["name"], by_class[c]) for c in sorted(distinct)],
-                          "Open link in…")
+            # Egos already on this desktop come first - on a mixed workspace one
+            # of them is almost always the answer, and walker binds F1/F2 to the
+            # top rows. The rest still have to be offered: otherwise a link can
+            # never be sent to an ego that happens to have no window here.
+            chosen = pick(ego_options(by_class, first=distinct), "Open link in…")
+            if chosen is None:
+                return
+            target = resolve_choice(chosen)
             if target is None:
                 return
 
-    # 3. Nothing here: ask which profile to start on this desktop.
+    # 3. Nothing here: ask which ego to start on this desktop.
     if target is None:
-        opts = [(t["name"], t) for t in by_class.values()]
-        opts.sort(key=lambda o: (not o[1]["managed"], o[0]))
-        opts.append(("+ New profile…", "__new__"))
-        chosen = pick(opts, "No browser on this desktop — open link in…")
+        chosen = pick(ego_options(by_class),
+                      "No ego on this desktop — open link in…")
         if chosen is None:
             return
-        if chosen == "__new__":
-            name = prompt_text("Name for the new profile")
-            if not name:
-                return
-            target = profiles()[add_profile(name)]
-        else:
-            target = chosen
+        target = resolve_choice(chosen)
+        if target is None:
+            return
 
     # Focus the profile's window on this desktop so the tab lands here, not on
     # whatever desktop that profile last had focus on.
