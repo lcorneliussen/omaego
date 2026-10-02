@@ -146,6 +146,11 @@ opens so you can sign in. Rules that name no ego, such as the Zoom rewrites, are
 listed underneath. Text entry goes through walker rather than QML dialogs, so
 the picker you already know handles it and the QML stays small.
 
+Every ego has a colour. Names in the bar carry it, the panel shows it as a chip,
+and **while the panel is open every ego's windows are outlined in that colour** —
+so the mapping between a name and the tiles on screen is readable at a glance.
+Override one with a `.ego-color` file (`rrggbb`) in the ego's directory.
+
 It gets everything from one `omaego panel` call, and never logs its polling.
 
 **After enabling or moving the widget, run `omarchy restart shell`** — a hot

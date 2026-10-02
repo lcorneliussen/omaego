@@ -468,43 +468,55 @@ def remove_rule(pattern):
     return False
 
 
-HILITE = "rgb(f7768e)"
+# Distinguishable, theme-neutral. An ego keeps its colour as long as the set of
+# egos does not change; override per ego with a .ego-color file holding "rrggbb".
+PALETTE = ["7aa2f7", "9ece6a", "e0af68", "bb9af7", "7dcfff", "ff9e64", "f7768e"]
 
 
-def highlight(slug=None):
-    """Outline an ego's windows on hover; with no slug, clear every one.
+def ego_color(slug):
+    d = EGO_ROOT / slug / ".ego-color"
+    if d.exists():
+        try:
+            return d.read_text().strip().lstrip("#")
+        except OSError:
+            pass
+    order = sorted(profiles())
+    return PALETTE[order.index(slug) % len(PALETTE)] if slug in order else "7aa2f7"
 
-    Only the border COLOUR is touched. Setting border_size as well reflows the
-    tiling and visibly resizes windows, which is not what an outline should do.
 
-    A window hidden inside a tab group cannot show a border, so the group's
-    visible member is outlined in its place.
+def highlight(mode=None):
+    """Outline ego windows while the panel is open.
 
-    Every dispatch goes out in one `hyprctl --batch`. One process per window per
-    property made hovering lag badly; batched it is a single ~6ms call.
+    mode "all" colours every ego's windows in that ego's own colour, so the
+    mapping between a name in the panel and the tiles on screen is readable at a
+    glance. Anything else clears.
+
+    Colour only - setting border_size reflows the tiling and resizes windows.
+    A window hidden in a tab group cannot show a border, so its group's visible
+    member is outlined instead. Everything goes out in one hyprctl --batch.
     """
-    want = profiles().get(slug or "", {}).get("wm_class")
     clients = hyprctl("clients") or []
     by_addr = {c["address"]: c for c in clients}
-
-    targets = set()
-    if want:
-        for c in clients:
-            if c.get("class") != want:
-                continue
-            if c.get("hidden") and c.get("grouped"):
-                visible = next((a for a in c["grouped"]
-                                if by_addr.get(a) and not by_addr[a].get("hidden")), None)
-                targets.add(visible or c["address"])
-            else:
-                targets.add(c["address"])
+    want = {}
+    if mode == "all":
+        for slug, prof in profiles().items():
+            colour = ego_color(slug)
+            for c in clients:
+                if c.get("class") != prof["wm_class"]:
+                    continue
+                addr = c["address"]
+                if c.get("hidden") and c.get("grouped"):
+                    addr = next((a for a in c["grouped"]
+                                 if by_addr.get(a) and not by_addr[a].get("hidden")), addr)
+                want[addr] = colour
 
     cmds = []
     for c in clients:
         cls = c.get("class", "")
         if not (cls.startswith("chrome-") or cls == "google-chrome"):
             continue
-        value = HILITE if c["address"] in targets else "unset"
+        colour = want.get(c["address"])
+        value = f"rgb({colour})" if colour else "unset"
         for prop in ("active_border_color", "inactive_border_color"):
             cmds.append(f"dispatch hl.dsp.window.set_prop({{ window = "
                         f"'address:{c['address']}', prop = '{prop}', "
@@ -1170,7 +1182,7 @@ def main(argv):
         return 0
 
     if cmd == "highlight":
-        highlight(argv[1] if len(argv) > 1 and argv[1] != "off" else None)
+        highlight("all" if len(argv) > 1 and argv[1] == "all" else None)
         return 0
 
     if cmd == "panel":
@@ -1201,6 +1213,7 @@ def main(argv):
             "workspace": current_workspace(),
             "fallback": (profiles().get(dflt or "") or {}).get("name"),
             "egos": [{"slug": t["slug"], "name": t["name"], "class": t["wm_class"],
+                      "color": "#" + ego_color(t["slug"]),
                       "default": t["slug"] == dflt,
                       "here": t["wm_class"] in here,
                       "apps": [panel_app(a, t["name"]) for a in inst.get(t["slug"], [])],

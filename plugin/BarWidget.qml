@@ -53,6 +53,11 @@ Panel {
   readonly property int barSize: bar ? bar.barSize : Style.bar.sizeHorizontal
 
   function refresh() { if (!probe.running) probe.running = true }
+
+  // Outline every ego's windows in its own colour for as long as the panel is
+  // open. Doing it on hover meant chasing a small target while looking away at
+  // the windows; this way the whole mapping is visible at once.
+  onOpenedChanged: root.run([root.omaego, "highlight", opened ? "all" : "off"])
   function run(args) { runner.command = args; runner.running = true }
   function later() { reloadTimer.restart() }
 
@@ -156,7 +161,7 @@ Panel {
           // impossible to hit while looking away at the windows.
           Text {
             text: modelData.name
-            color: hover.containsMouse && root.bar ? root.bar.urgent : root.fg
+            color: modelData.color || root.fg
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             height: root.barSize
@@ -164,11 +169,7 @@ Panel {
             leftPadding: Style.space(2)
             rightPadding: Style.space(2)
             MouseArea {
-              id: hover
               anchors.fill: parent
-              hoverEnabled: true
-              onEntered: root.run([root.omaego, "highlight", modelData.slug])
-              onExited: root.run([root.omaego, "highlight", "off"])
               onClicked: root.toggle()
             }
           }
