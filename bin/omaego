@@ -300,8 +300,13 @@ def focus(address, confirm=True):
 
 # --- picker -----------------------------------------------------------------
 
-def pick(options, prompt):
-    """options: list of (label, value). Returns value or None."""
+def pick(options, prompt, free=False):
+    """options: list of (label, value). Returns value, or None.
+
+    With free=True, text that matches no row is returned as ("free", text)
+    instead of being discarded. walker filters its rows by what you type, so
+    pasting a URL hides every row - including the one offering to take a URL.
+    """
     if not options:
         return None
     labels = "\n".join(label for label, _ in options)
@@ -319,6 +324,8 @@ def pick(options, prompt):
     for label, value in options:
         if label == chosen:
             return value
+    if free and chosen:
+        return ("free", chosen)
     log(f"pick: no option matched {chosen!r}")
     return None
 
@@ -754,9 +761,28 @@ def name_from_url(url):
     host = (urlsplit(url).hostname or "").lower().lstrip("www.")
     parts = [p for p in host.split(".") if p not in ("com", "org", "net", "io",
                                                      "app", "co", "www")]
-    # The first meaningful label, not the registrable domain: internal tools are
-    # named by their subdomain (jira.acme.io is "Jira", not "Acme").
-    return (parts[0] if parts else host).replace("-", " ").title()
+    return (name_candidates(url) or [host])[0]
+
+
+def name_candidates(url):
+    """Plausible names for a URL, best first.
+
+    No rule gets both shapes right - jira.acme.io is "Jira" (the subdomain)
+    while acme.odoo.com is "Odoo" (the registrable domain) - so offer both
+    and let the choice be made.
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    for junk in ("www.", "app.", "my."):
+        if host.startswith(junk):
+            host = host[len(junk):]
+    parts = [p for p in host.split(".")
+             if p not in ("com", "org", "net", "io", "co", "app", "de", "ai")]
+    out = []
+    for p in ([parts[0]] if parts else []) + (parts[1:2] if len(parts) > 1 else []):
+        n = p.replace("-", " ").title()
+        if n not in out:
+            out.append(n)
+    return out or [host]
 
 
 def normalize_url(url):
@@ -768,8 +794,13 @@ def normalize_url(url):
 def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False):
     # One of url/name is enough; ask for whatever is missing.
     if url and not display:
-        display = prompt_text(f"Name for {urlsplit(normalize_url(url)).hostname}") \
-            or name_from_url(normalize_url(url))
+        u = normalize_url(url)
+        cands = name_candidates(u)
+        choice = pick([(c, c) for c in cands],
+                      f"Name for {urlsplit(u).hostname}…", free=True)
+        if choice is None:
+            return 1
+        display = choice[1].strip() if isinstance(choice, tuple) else choice
     elif display and not url:
         url = prompt_text(f"URL for {display}")
         if not url:
@@ -1153,20 +1184,23 @@ def main(argv):
             have = {a["url"] for a in installed_apps().get(slug, [])}
             opts = [(f"{v[0]}", k) for k, v in sorted(WEBAPPS.items())
                     if v[1] not in have]
-            opts.append(("+ Any URL…", "__custom__"))
-            key = pick(opts, f"Add a web app to {profiles()[slug]['name']}…")
+            key = pick(opts, f"App, URL or name for {profiles()[slug]['name']}…",
+                       free=True)
             if key is None:
                 return 0
-            if key != "__custom__":
-                return app_add(slug, [key])
-            # Accept either a URL or a name; ask for the other.
-            first = prompt_text("URL, or a name if you would rather start there")
-            if not first:
-                return 0
-            looks_like_url = "." in first and " " not in first
-            return app_add(slug, [],
-                           url=first if looks_like_url else None,
-                           display=None if looks_like_url else first)
+            if isinstance(key, tuple):            # typed something not in the list
+                typed = key[1].strip()
+                hit = next((k for k, v in WEBAPPS.items()
+                            if v[0].lower() == typed.lower()
+                            or k.lower() == typed.lower()), None)
+                if hit:
+                    return app_add(slug, [hit])
+                looks_like_url = "://" in typed or (
+                    "." in typed and " " not in typed)
+                return app_add(slug, [],
+                               url=typed if looks_like_url else None,
+                               display=None if looks_like_url else typed)
+            return app_add(slug, [key])
 
         if sub in ("add", "remove"):
             if len(argv) < 3:
