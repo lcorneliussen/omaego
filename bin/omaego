@@ -531,7 +531,7 @@ _G = "https://www.gstatic.com/images/branding/product/2x/{}_2020q4_512dp.png"
 # key: (display name, url, rule domain or None, icon url or None)
 # A rule domain is only suggested where one ego plausibly owns the whole host.
 WEBAPPS = {
-    "teams":    ("Teams",     "https://teams.microsoft.com/",     "teams.microsoft.com", None),
+    "teams":    ("Teams",     "https://teams.microsoft.com/",     None,                  None),
     "outlook":  ("Outlook",   "https://outlook.office.com/mail/", None,                  None),
     "office":   ("Office",    "https://www.office.com/",          None,                  None),
     "gmail":    ("Gmail",     "https://mail.google.com/",         None,  _G.format("gmail")),
@@ -539,8 +539,8 @@ WEBAPPS = {
     "gchat":    ("Chat",      "https://chat.google.com/",         None,  _G.format("chat")),
     "gdrive":   ("Drive",     "https://drive.google.com/",        None,  _G.format("drive")),
     "gdocs":    ("Docs",      "https://docs.google.com/",         None,  _G.format("docs")),
-    "meet":     ("Meet",      "https://meet.google.com/",         "meet.google.com", _G.format("meet")),
-    "keep":     ("Keep",      "https://keep.google.com/",         "keep.google.com", _G.format("keep")),
+    "meet":     ("Meet",      "https://meet.google.com/",         None,  _G.format("meet")),
+    "keep":     ("Keep",      "https://keep.google.com/",         None,  _G.format("keep")),
     "slack":    ("Slack",     "https://app.slack.com/client",     None,                  None),
     "zoom":     ("Zoom",      "https://app.zoom.us/wc/home",      None,                  None),
     "whatsapp": ("WhatsApp",  "https://web.whatsapp.com/",        "web.whatsapp.com",    None),
@@ -599,7 +599,7 @@ def append_rule(domain, ego_name):
         f.write(f'\n[[rule]]\nurl = "https://*{domain}/*"\nprofile = "{ego_name}"\n')
 
 
-def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=True):
+def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False):
     egos = profiles()
     if slug not in egos:
         print(f"unknown ego {slug!r} (see: omaego list)", file=sys.stderr)
@@ -647,8 +647,11 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=True):
                 append_rule(domain, ego["name"])
                 print(f"      rule added:   https://*{domain}/* -> {ego['name']}")
         elif want_rule and not domain:
-            print(f"      no rule: this host is shared between egos, "
-                  f"so routing it would be ambiguous")
+            print("      no rule: several egos can share this host "
+                  "(Teams, Outlook, Gmail, Meet), so routing it to one "
+                  "would be wrong")
+        elif domain:
+            print(f"      --rule would add:  https://*{domain}/* -> {ego['name']}")
     return 0
 
 
@@ -668,6 +671,11 @@ opens on the workspace you are on - never by switching desktops.
   omaego import <src> [name]
                          lift a Chrome-internal profile into its own ego
                          (needs Chrome fully quit)
+  omaego rule list       the routing rules
+  omaego rule add <url-glob> <ego> [--app]
+  omaego app list        web apps you can pin to an ego
+  omaego app add <ego> <app>...   install them (--rule also routes that host)
+  omaego app remove <ego> <app>...
   omaego launch <slug> [url]
   omaego default [slug]  show/set the FALLBACK ego: the one that owns plain
                          "Google Chrome" and web apps. Not an "active" ego -
@@ -754,8 +762,16 @@ def main(argv):
         if len(argv) < 2:
             print("usage: urlrouter add <name>", file=sys.stderr)
             return 2
-        slug = add_profile(" ".join(argv[1:]))
-        print(f"added {slug}")
+        name = " ".join(argv[1:])
+        slug = add_profile(name)
+        print(f"created ego {slug!r} ({name})\n")
+        print("next:")
+        print(f"  1. omaego launch {slug}")
+        print("     sign in to Google/Microsoft in the window that opens; this ego")
+        print("     syncs to that account and nothing else does")
+        print(f"  2. omaego app add {slug} teams outlook      # see: omaego app list")
+        print(f"  3. omaego rule add 'https://*.example.com/*' {name}")
+        print("     for hosts that must always open as this ego, wherever you are")
         return 0
 
     if cmd == "launch":
@@ -810,6 +826,96 @@ def main(argv):
             write_desktop_entries()
         print(f"{changed} profile(s) restructured")
         return 0
+
+    if cmd == "rule":
+        sub = argv[1] if len(argv) > 1 else "list"
+        if sub == "list":
+            rules = load_rules()
+            if not rules:
+                print(f"no rules in {RULES}")
+                return 0
+            for r in rules:
+                pat = r.get("url") or r.get("match") or "(source only)"
+                bits = [f"-> {r['profile']}"] if r.get("profile") else ["-> workspace/picker"]
+                if r.get("app"): bits.append("as app window")
+                if r.get("rewrite"): bits.append("rewritten")
+                if r.get("source"): bits.append(f"from {r['source']}")
+                print(f"  {pat:<48} {'  '.join(bits)}")
+            return 0
+        if sub == "add":
+            if len(argv) < 4:
+                print("usage: omaego rule add <url-glob> <ego> [--app]", file=sys.stderr)
+                return 2
+            pat, want = argv[2], argv[3]
+            egos = profiles()
+            ego = egos.get(want) or next(
+                (e for e in egos.values() if e["name"].lower() == want.lower()), None)
+            if ego is None:
+                print(f"unknown ego {want!r} (see: omaego list)", file=sys.stderr)
+                return 1
+            for r in load_rules():
+                if (r.get("url") or r.get("match")) == pat:
+                    print(f"rule for {pat} already exists -> {r.get('profile')}",
+                          file=sys.stderr)
+                    return 1
+            with RULES.open("a") as f:
+                f.write(f'\n[[rule]]\nurl = "{pat}"\nprofile = "{ego["name"]}"\n')
+                if "--app" in sys.argv[1:]:
+                    f.write("app = true\n")
+            print(f"added: {pat} -> {ego['name']}")
+            return 0
+        print(f"unknown: omaego rule {sub}", file=sys.stderr)
+        return 2
+
+    if cmd == "app":
+        sub = argv[1] if len(argv) > 1 else "list"
+        if sub == "list":
+            print("web apps you can pin to an ego "
+                  f"(name template {APP_NAME_TEMPLATE!r}):\n")
+            for k, (nm, url, dom, _ic) in sorted(WEBAPPS.items()):
+                tail = f"  [rule: {dom}]" if dom else ""
+                print(f"  {k:<10} {nm:<10} {url}{tail}")
+            print("\n  omaego app add <ego> <app>...            install them\n  omaego app add <ego> <app> --rule        also route that host to the ego")
+            print("  omaego app add <ego> --url <url> --name <name>")
+            print("  omaego app remove <ego> <app>...")
+            print("\n[rule] marks a host one ego can plausibly own outright; "
+                  "--rule writes it.\nHosts without it are shared between egos "
+                  "(Teams, Outlook, Gmail, Meet) — a rule\nthere would send a "
+                  "customer's link to the wrong identity.")
+            return 0
+
+        if sub in ("add", "remove"):
+            if len(argv) < 3:
+                print(f"usage: omaego app {sub} <ego> <app>...", file=sys.stderr)
+                return 2
+            slug, keys = argv[2], argv[3:]
+            raw = sys.argv[1:]
+            def flagval(name):
+                for i, a in enumerate(raw):
+                    if a == name and i + 1 < len(raw):
+                        return raw[i + 1]
+                    if a.startswith(name + "="):
+                        return a.split("=", 1)[1]
+                return None
+            if sub == "add":
+                return app_add(slug, keys, name_tpl=flagval("--name-template"),
+                               url=flagval("--url"), display=flagval("--name"),
+                               want_rule="--rule" in raw)
+            egos = profiles()
+            if slug not in egos:
+                print(f"unknown ego {slug!r}", file=sys.stderr); return 1
+            tpl = flagval("--name-template") or APP_NAME_TEMPLATE
+            for k in keys:
+                if k not in WEBAPPS:
+                    print(f"unknown app {k!r}", file=sys.stderr); continue
+                name = tpl.format(app=WEBAPPS[k][0], ego=egos[slug]["name"])
+                r = subprocess.run(["omarchy", "webapp", "remove", name],
+                                   capture_output=True, text=True)
+                print(f"  {'removed  ' if r.returncode == 0 else 'not found'}  {name}")
+            return 0
+
+        print(f"unknown: omaego app {sub}", file=sys.stderr)
+        return 2
 
     if cmd == "sync":
         write_desktop_entries()

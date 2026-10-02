@@ -20,6 +20,26 @@ system into; it is an identity that happens to have windows on a workspace. A
 workspace usually belongs to one ego, and links resolve inside the workspace
 they were clicked from.
 
+## Setting up an ego
+
+```bash
+omaego add "Acme"            # a new --user-data-dir, its own class, own sync
+omaego launch acme           # sign in to Google/Microsoft in the window it opens
+omaego app add acme teams outlook
+omaego rule add 'https://acme.atlassian.net/*' Acme
+```
+
+`omaego add` prints those next steps for you. Nothing else on the machine shares
+that ego's cookies, extensions or sync account.
+
+To lift an existing Chrome-internal profile out into its own ego (keeping its
+history, bookmarks and logins), quit Chrome fully and:
+
+```bash
+omaego import google-chrome          # lists what is inside
+omaego import google-chrome "Acme"   # copies it out; the original stays as a rollback
+```
+
 ## How a link is routed
 
 1. **A rule in `~/.config/omaego/rules.toml`** → that ego, forced.
@@ -87,13 +107,28 @@ The binaries are symlinks **into the repo**, so do not delete the checkout.
 ## Web apps, pinned to an ego
 
 ```bash
-omarchy webapp install "Teams Work" https://teams.microsoft.com/ "" \
-  "$HOME/.local/bin/omaego-webapp --ego=work --app=https://teams.microsoft.com/"
+omaego app list                           # the catalogue
+omaego app add work teams outlook         # -> "Teams Work", "Outlook Work"
+omaego app add personal gmail gcal gchat
+omaego app add work --url https://acme.example.com/ --name "Acme"
 ```
 
-The fourth argument is what keeps the whole command line. `omarchy-launch-webapp`
-keeps only the **first token** of an `Exec=` line, which is why the ego has to be
-chosen inside a wrapper script.
+Each app becomes its own window, signed into that ego, with a real icon. The
+launcher name is `{app} {ego}` by default (`OMAEGO_APP_NAME` to change it), so
+typing "teams" in the launcher finds every tenant's Teams at once.
+
+Icons are normalised on the way in: sites serve JPEGs under a `.png` name and
+64px favicons into the 256px directory, both of which look wrong on a dark bar.
+
+`--rule` additionally routes that host to the ego — offered only for hosts one
+ego can plausibly own outright. **Teams, Outlook, Gmail and Meet deliberately
+have no rule**: several egos share those hosts, so a rule would send a
+customer's link to the wrong identity.
+
+Under the hood this is `omarchy webapp install` with its fourth argument, the
+only one that keeps a whole command line — `omarchy-launch-webapp` otherwise
+truncates `Exec=` to its first token, which is why the ego must be chosen inside
+a wrapper script.
 
 ## The bar widget
 
