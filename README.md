@@ -132,6 +132,27 @@ only one that keeps a whole command line — `omarchy-launch-webapp` otherwise
 truncates `Exec=` to its first token, which is why the ego must be chosen inside
 a wrapper script.
 
+## Learning routes from use
+
+Every routed link is recorded with which ego took it and why (`rule`,
+`workspace`, `picked`). `omaego learn` reads that back and proposes rules for
+hosts that consistently went to one ego:
+
+```
+omaego learn            # suggestions you can paste
+omaego learn --agent    # hand them to the default omarchy agent to reason about
+```
+
+A host-wide suggestion is withheld when a rule already pins part of that host —
+`bitbucket.org/<customer>/*` existing means `bitbucket.org/*` would quietly
+swallow every other customer on the same host.
+
+**What is stored:** host and the first two path segments only, in
+`~/.local/state/omaego/routes.jsonl`. Enough to propose
+`https://git.example.com/acme/*`, short of recording what you read. Query
+strings and fragments are dropped — they carry tokens. Delete the file to
+forget; `OMAEGO_NO_ROUTE_LOG=1` never writes it.
+
 ## The bar widget
 
 The label shows the ego owning the current workspace, dimmed when there is none

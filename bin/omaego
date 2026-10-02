@@ -21,6 +21,29 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 LOG = Path.home() / ".cache/omaego.log"
+ROUTES = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omaego/routes.jsonl"
+
+
+def log_route(url, ego, reason):
+    """Record where a link went, to learn rules from later.
+
+    Only the host and the first two path segments are kept - enough to propose
+    a glob like https://git.example.com/acme/*, and short of recording what was
+    actually read. Query strings and fragments are dropped; they carry tokens.
+    Delete the file to forget, or set OMAEGO_NO_ROUTE_LOG=1 to never write it.
+    """
+    if os.environ.get("OMAEGO_NO_ROUTE_LOG") == "1" or not url:
+        return
+    try:
+        u = urlsplit(url)
+        path = "/".join(u.path.strip("/").split("/")[:2])
+        ROUTES.parent.mkdir(parents=True, exist_ok=True)
+        with ROUTES.open("a") as f:
+            f.write(json.dumps({"t": int(time.time()), "ego": ego,
+                                "why": reason, "host": (u.hostname or "").lower(),
+                                "path": path}) + "\n")
+    except Exception:
+        pass
 
 
 def log(msg):
@@ -579,6 +602,7 @@ def open_url(url=None, incognito=False):
             log(f"rewrite: {url} -> {new_url}")
             url = new_url
     wanted = rule.get("profile") if rule else None
+    why = "rule" if wanted else None
     target = None
     if wanted:
         slug = slugify(wanted)
@@ -593,13 +617,16 @@ def open_url(url=None, incognito=False):
         distinct = {cls for _, cls, _ in here}
         if focused:
             target = by_class[focused[0]]
+            why = why or "workspace"
         elif len(distinct) == 1:
             target = by_class[distinct.pop()]
+            why = why or "workspace"
         else:
             # More than one ego here: take the first in tiling order rather than
             # interrupting with a picker. A rule still overrides, and the picker
             # remains for a workspace with no ego at all.
             target = by_class[next(cls for _, cls, _ in here)]
+            why = why or "workspace"
 
     # 3. Nothing here: ask which ego to start on this desktop.
     if target is None:
@@ -610,9 +637,12 @@ def open_url(url=None, incognito=False):
         target = resolve_choice(chosen)
         if target is None:
             return
+        why = why or "picked"
 
     # Focus the profile's window on this desktop so the tab lands here, not on
     # whatever desktop that profile last had focus on.
+    log_route(url, target["name"], why or "fallback")
+
     addr = next((a for a, cls, _ in here if cls == target["wm_class"] and a), None)
     if as_app:
         launch(target, url, as_app=True)
@@ -886,6 +916,7 @@ opens on the workspace you are on - never by switching desktops.
   omaego import <src> [name]
                          lift a Chrome-internal profile into its own ego
                          (needs Chrome fully quit)
+  omaego learn [--agent] suggest rules from where links actually went
   omaego rule list       the routing rules
   omaego rule add <url-glob> <ego> [--app]
   omaego app list        web apps you can pin to an ego
@@ -1257,6 +1288,74 @@ def main(argv):
         for a, cls, foc in rows:
             kind = "webapp" if a is None else "browser"
             print(f"{a or '-':<18} {kind:<8} {cls}{' (focused)' if foc else ''}")
+        return 0
+
+    if cmd == "learn":
+        if not ROUTES.exists():
+            print(f"nothing logged yet ({ROUTES})")
+            return 0
+        seen = {}
+        for line in ROUTES.read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            host, first = r.get("host", ""), (r.get("path") or "").split("/")[0]
+            if not host:
+                continue
+            for key in {host, f"{host}/{first}" if first else host}:
+                seen.setdefault(key, {}).setdefault(r["ego"], 0)
+                seen[key][r["ego"]] += 1
+
+        suggestions = []
+        for key, egos in seen.items():
+            total = sum(egos.values())
+            ego, hits = max(egos.items(), key=lambda kv: kv[1])
+            if total < 3 or hits / total < 0.8:
+                continue                      # too few, or genuinely mixed
+            pat = f"https://{key}/*" if "/" in key else f"https://{key}/*"
+            host_only = "/" not in key
+            # A host-wide suggestion is wrong when a rule already pins part of
+            # that host: bitbucket.org/<customer>/* exists, so bitbucket.org/*
+            # would quietly swallow every other customer on the same host.
+            if host_only and any(key in (r.get("url") or r.get("match") or "")
+                                 for r in load_rules()):
+                continue
+            if match_rule(pat.replace("*", ""), None):
+                continue                      # a rule already covers it
+            # Prefer the longer, more specific key when both qualify for one ego
+            suggestions.append((hits, total, pat, ego))
+        suggestions.sort(reverse=True)
+        kept, hosts = [], set()
+        for hits, total, pat, ego in suggestions:
+            root_host = pat.split("/")[2]
+            if "/" not in pat[8:].rstrip("*").rstrip("/") and root_host in hosts:
+                continue
+            hosts.add(root_host)
+            kept.append((hits, total, pat, ego))
+
+        if "--agent" in sys.argv[1:]:
+            lines = [f"{p} -> {e} ({h}/{t} opens)" for h, t, p, e in kept[:40]]
+            current = "\n".join(f"{r.get('url') or r.get('match')} -> {r.get('profile')}"
+                                for r in load_rules())
+            prompt = (
+                "I route links between Chrome profiles (egos) with omaego. "
+                "Below is where links actually went, learned from use, and the "
+                "rules I already have. Suggest `omaego rule add '<glob>' <Ego>` "
+                "lines worth adding, skip anything already covered, and say "
+                "which look ambiguous.\n\nObserved:\n" + "\n".join(lines) +
+                "\n\nExisting rules:\n" + (current or "(none)"))
+            subprocess.Popen(["omarchy", "agent", "prompt", prompt],
+                             start_new_session=True)
+            print(f"handed {len(kept)} observations to the default agent")
+            return 0
+
+        if not kept:
+            print("no confident suggestions yet - keep using it")
+            return 0
+        print("Routes worth adding (a host that consistently went to one ego):\n")
+        for hits, total, pat, ego in kept:
+            print(f"  omaego rule add '{pat}' {ego}".ljust(62) + f"# {hits}/{total}")
         return 0
 
     if cmd == "highlight":
