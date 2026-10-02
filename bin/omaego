@@ -764,7 +764,7 @@ def name_from_url(url):
     return (name_candidates(url) or [host])[0]
 
 
-def name_candidates(url):
+def name_candidates(url, ego_name=None):
     """Plausible names for a URL, best first.
 
     No rule gets both shapes right - jira.acme.io is "Jira" (the subdomain)
@@ -780,6 +780,11 @@ def name_candidates(url):
     out = []
     for p in ([parts[0]] if parts else []) + (parts[1:2] if len(parts) > 1 else []):
         n = p.replace("-", " ").title()
+        # The ego is already known from the card the app is being added under,
+        # so its own name is never the app's name: acme.odoo.com under the
+        # Acme ego is simply "Odoo".
+        if ego_name and n.lower() == ego_name.lower():
+            continue
         if n not in out:
             out.append(n)
     return out or [host]
@@ -795,12 +800,15 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False):
     # One of url/name is enough; ask for whatever is missing.
     if url and not display:
         u = normalize_url(url)
-        cands = name_candidates(u)
-        choice = pick([(c, c) for c in cands],
-                      f"Name for {urlsplit(u).hostname}…", free=True)
-        if choice is None:
-            return 1
-        display = choice[1].strip() if isinstance(choice, tuple) else choice
+        cands = name_candidates(u, ego["name"])
+        if len(cands) == 1:
+            display = cands[0]          # nothing to choose between; just use it
+        else:
+            choice = pick([(c, c) for c in cands],
+                          f"Name for {urlsplit(u).hostname}…", free=True)
+            if choice is None:
+                return 1
+            display = choice[1].strip() if isinstance(choice, tuple) else choice
     elif display and not url:
         url = prompt_text(f"URL for {display}")
         if not url:
