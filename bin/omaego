@@ -923,7 +923,8 @@ def normalize_url(url):
     return url
 
 
-def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False):
+def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
+            interactive=False):
     # Resolve the ego FIRST: naming a web app needs it, both to exclude the
     # ego's own name from the candidates and to build the launcher name.
     egos = profiles()
@@ -963,8 +964,16 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False):
             return 1
         items.append(WEBAPPS[k])
 
+    have = installed_apps().get(slug, [])
     for app_name, app_url, domain, icon_url in items:
         name = tpl.format(app=app_name, ego=ego["name"])
+        clash = next((a for a in have
+                      if a["url"] == app_url or a["name"] == name), None)
+        if clash:
+            msg = f"{clash['name']} is already in {ego['name']}"
+            print(f"  {msg}")
+            notify(msg + " — remove it first to re-add")
+            continue
         icon_slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
         icon_arg = ""
         if icon_url:
@@ -979,12 +988,27 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False):
         r = run_install(icon_arg)
         if r.returncode != 0 and not icon_arg:
             # omarchy aborts the whole install when it cannot fetch an icon, and
-            # plenty of internal hosts serve none. The app matters more than its
-            # picture: retry with Chrome's own icon.
-            r = run_install("google-chrome")
-            if r.returncode == 0:
+            # plenty of internal hosts serve none. Ask for one before falling
+            # back to a generic picture.
+            host = urlsplit(app_url).hostname
+            # Only ask where someone is there to answer. A scripted `app add`
+            # would otherwise sit on this prompt until walker times out.
+            given = prompt_text(f"No icon found at {host} — paste an image URL, "
+                                f"or Enter to use a generic one") if interactive else None
+            if given:
+                dest = ICON_DIR / f"{icon_slug}.png"
+                if fetch_icon(given.strip(), dest) and normalize_icon(dest):
+                    icon_arg = icon_slug
+                    r = run_install(icon_arg)
+                else:
+                    notify(f"could not use that image; falling back")
+                    r = run_install("google-chrome")
+            else:
+                r = run_install("google-chrome")
+            if r.returncode == 0 and icon_arg != icon_slug:
                 print(f"  {name}: installed with a generic icon "
-                      f"(no icon reachable at {urlsplit(app_url).hostname})")
+                      f"(none reachable at {host}); set one later with:")
+                print(f"      omaego app icon {slug} {name!r} <image-url>")
         if r.returncode != 0:
             msg = (r.stderr.strip() or r.stdout.strip() or "no output")[:140]
             print(f"  {name}: FAILED  {msg}", file=sys.stderr)
@@ -1040,6 +1064,7 @@ opens on the workspace you are on - never by switching desktops.
   omaego app add <ego> --url <url> | --name <name>
                          either one is enough; you are asked for the other
   omaego app remove <ego> <app>...
+  omaego app icon <ego> "<app name>" <image url|path>
   omaego launch <slug> [url]
   omaego default [slug]  show/set the FALLBACK ego: the one that owns plain
                          "Google Chrome" and web apps. Not an "active" ego -
@@ -1305,10 +1330,50 @@ def main(argv):
             print("\n  omaego app add <ego> <app>...            install them\n  omaego app add <ego> <app> --rule        also route that host to the ego")
             print("  omaego app add <ego> --url <url> --name <name>")
             print("  omaego app remove <ego> <app>...")
+            print('  omaego app icon <ego> "<app name>" <image url|path>')
             print("\n[rule] marks a host one ego can plausibly own outright; "
                   "--rule writes it.\nHosts without it are shared between egos "
                   "(Teams, Outlook, Gmail, Meet) — a rule\nthere would send a "
                   "customer's link to the wrong identity.")
+            return 0
+
+        if sub == "icon":
+            # Set or replace an installed web app's icon, for the common case of
+            # a host that serves none and got the generic one.
+            if len(argv) < 4:
+                print("usage: omaego app icon <ego> <app name> <image url|path>",
+                      file=sys.stderr)
+                return 2
+            slug, want = argv[2], argv[3]
+            src = argv[4] if len(argv) > 4 else None
+            app = next((a for a in installed_apps().get(slug, [])
+                        if a["name"].lower() == want.lower()), None)
+            if app is None:
+                print(f"no app {want!r} in {slug}; see: omaego app installed",
+                      file=sys.stderr)
+                return 1
+            if not src:
+                src = prompt_text(f"Image URL for {app['name']}")
+                if not src:
+                    return 0
+            icon_slug = re.sub(r"[^a-z0-9]+", "-", app["name"].lower()).strip("-")
+            ICON_DIR.mkdir(parents=True, exist_ok=True)
+            dest = ICON_DIR / f"{icon_slug}.png"
+            ok = (Path(src).exists() and shutil.copy(src, dest)) or fetch_icon(src, dest)
+            if not (ok and normalize_icon(dest)):
+                print(f"could not use {src}", file=sys.stderr)
+                notify(f"could not use that image for {app['name']}")
+                return 1
+            d = DESKTOP_DIR / app["desktop"]
+            d.write_text(re.sub(r"^Icon=.*$", f"Icon={icon_slug}", d.read_text(),
+                                flags=re.M))
+            subprocess.run(["gtk-update-icon-cache",
+                            str(Path.home() / ".local/share/icons/hicolor")],
+                           capture_output=True)
+            subprocess.run(["update-desktop-database", str(DESKTOP_DIR)],
+                           capture_output=True)
+            print(f"  {app['name']}: icon set from {src}")
+            notify(f"{app['name']}: icon updated")
             return 0
 
         if sub == "installed":
@@ -1352,11 +1417,12 @@ def main(argv):
                             if v[0].lower() == typed.lower()
                             or k.lower() == typed.lower()), None)
                 if hit:
-                    return app_add(slug, [hit])
+                    return app_add(slug, [hit], interactive=True)
                 looks_like_url = "://" in typed or ("." in typed and " " not in typed)
                 return app_add(slug, [],
                                url=typed if looks_like_url else None,
-                               display=None if looks_like_url else typed)
+                               display=None if looks_like_url else typed,
+                               interactive=True)
 
             have = {a["url"] for a in installed_apps().get(slug, [])}
             opts = [(v[0], k) for k, v in sorted(WEBAPPS.items()) if v[1] not in have]
@@ -1364,7 +1430,7 @@ def main(argv):
                 notify(f"every catalogue app is already installed for {name}")
                 return 0
             key = pick(opts, f"Add a web app to {name}…")
-            return 0 if key is None else app_add(slug, [key])
+            return 0 if key is None else app_add(slug, [key], interactive=True)
 
         if sub in ("add", "remove"):
             if len(argv) < 3:
