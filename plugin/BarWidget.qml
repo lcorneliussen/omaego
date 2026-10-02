@@ -145,10 +145,11 @@ Panel {
         Row {
           spacing: 0
           Text {
-            text: index === 0 ? "" : " · "
+            text: index === 0 ? "" : "·"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
+            anchors.verticalCenter: parent.verticalCenter
           }
           // The hit area is the whole card - full bar height and padded either
           // side. The glyph box alone is a few pixels tall and nearly
@@ -160,8 +161,8 @@ Panel {
             font.pixelSize: Style.font.caption
             height: root.barSize
             verticalAlignment: Text.AlignVCenter
-            leftPadding: Style.space(4)
-            rightPadding: Style.space(4)
+            leftPadding: Style.space(2)
+            rightPadding: Style.space(2)
             MouseArea {
               id: hover
               anchors.fill: parent
