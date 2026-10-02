@@ -397,10 +397,18 @@ def launch(target, url=None, new_window=False, incognito=False, as_app=False):
 
 
 def ego_options(by_class, first=()):
-    """Picker rows: every ego, with the ones on this desktop at the top."""
+    """Picker rows: every ego, the ones on this desktop first.
+
+    When some egos ARE on this desktop, the others are marked - picking one of
+    those opens a new window rather than reusing a tab, and that is worth
+    knowing before you pick. When nothing is here the prompt already says so,
+    and marking every row would just be noise.
+    """
     here_first = [t for c, t in sorted(by_class.items()) if c in first]
     rest = [t for c, t in sorted(by_class.items()) if c not in first]
-    rows = [(t["name"], t) for t in here_first + rest]
+    mark = " · not on this desktop" if here_first else ""
+    rows = [(t["name"], t) for t in here_first]
+    rows += [(t["name"] + mark, t) for t in rest]
     rows.append(("+ New ego…", "__new__"))
     return rows
 
