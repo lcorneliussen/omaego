@@ -924,6 +924,14 @@ def normalize_url(url):
 
 
 def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False):
+    # Resolve the ego FIRST: naming a web app needs it, both to exclude the
+    # ego's own name from the candidates and to build the launcher name.
+    egos = profiles()
+    if slug not in egos:
+        print(f"unknown ego {slug!r} (see: omaego list)", file=sys.stderr)
+        return 1
+    ego = egos[slug]
+
     # One of url/name is enough; ask for whatever is missing.
     if url and not display:
         u = normalize_url(url)
@@ -931,21 +939,16 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False):
         if len(cands) == 1:
             display = cands[0]          # nothing to choose between; just use it
         else:
-            choice = pick([(c, c) for c in cands],
-                          f"Name for {urlsplit(u).hostname}…", free=True)
+            choice = pick([(c, c) for c in cands], f"Name for {urlsplit(u).hostname}…")
             if choice is None:
                 return 1
-            display = choice[1].strip() if isinstance(choice, tuple) else choice
+            display = choice
     elif display and not url:
         url = prompt_text(f"URL for {display}")
         if not url:
             return 1
     url = normalize_url(url) if url else None
-    egos = profiles()
-    if slug not in egos:
-        print(f"unknown ego {slug!r} (see: omaego list)", file=sys.stderr)
-        return 1
-    ego = egos[slug]
+
     bin_webapp = os.environ.get("OMAEGO_WEBAPP",
                                 str(Path.home() / ".local/bin/omaego-webapp"))
     tpl = name_tpl or APP_NAME_TEMPLATE
@@ -969,10 +972,22 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False):
             if fetch_icon(icon_url, dest) and normalize_icon(dest):
                 icon_arg = icon_slug          # a bare name is used as-is
         exec_line = f"{bin_webapp} --ego={slug} --app={app_url}"
-        r = subprocess.run(["omarchy", "webapp", "install", name, app_url,
-                            icon_arg, exec_line], capture_output=True, text=True)
+        def run_install(icon):
+            return subprocess.run(["omarchy", "webapp", "install", name, app_url,
+                                   icon, exec_line], capture_output=True, text=True)
+
+        r = run_install(icon_arg)
+        if r.returncode != 0 and not icon_arg:
+            # omarchy aborts the whole install when it cannot fetch an icon, and
+            # plenty of internal hosts serve none. The app matters more than its
+            # picture: retry with Chrome's own icon.
+            r = run_install("google-chrome")
+            if r.returncode == 0:
+                print(f"  {name}: installed with a generic icon "
+                      f"(no icon reachable at {urlsplit(app_url).hostname})")
         if r.returncode != 0:
-            print(f"  {name}: FAILED  {r.stderr.strip()[:120]}", file=sys.stderr)
+            msg = (r.stderr.strip() or r.stdout.strip() or "no output")[:140]
+            print(f"  {name}: FAILED  {msg}", file=sys.stderr)
             continue
         if not icon_arg:                       # omarchy fetched it; fix it up
             normalize_icon(ICON_DIR / f"{icon_slug}.png")
@@ -1310,8 +1325,13 @@ def main(argv):
             return 0
 
         if sub == "pick":
-            # Interactive install, for the bar panel: walker chooses the app so
-            # the panel needs no catalogue UI of its own.
+            # Free text FIRST, then the catalogue.
+            #
+            # walker's dmenu filters its rows against what is typed and has no
+            # flag to hand back unmatched input, so a pasted URL hides every row
+            # and Enter returns nothing. Asking first is the only way a URL can
+            # be entered at all; Enter on an empty prompt falls through to the
+            # catalogue, so browsing still works.
             if len(argv) < 3:
                 print("usage: omaego app pick <ego>", file=sys.stderr)
                 return 2
@@ -1319,26 +1339,28 @@ def main(argv):
             if slug not in profiles():
                 print(f"unknown ego {slug!r}", file=sys.stderr)
                 return 1
-            have = {a["url"] for a in installed_apps().get(slug, [])}
-            opts = [(f"{v[0]}", k) for k, v in sorted(WEBAPPS.items())
-                    if v[1] not in have]
-            key = pick(opts, f"App, URL or name for {profiles()[slug]['name']}…",
-                       free=True)
-            if key is None:
-                return 0
-            if isinstance(key, tuple):            # typed something not in the list
-                typed = key[1].strip()
+            name = profiles()[slug]["name"]
+            typed = (prompt_text(f"{name}: paste a URL, or type a name "
+                                 f"— Enter alone to browse") or "").strip()
+
+            if typed:
                 hit = next((k for k, v in WEBAPPS.items()
                             if v[0].lower() == typed.lower()
                             or k.lower() == typed.lower()), None)
                 if hit:
                     return app_add(slug, [hit])
-                looks_like_url = "://" in typed or (
-                    "." in typed and " " not in typed)
+                looks_like_url = "://" in typed or ("." in typed and " " not in typed)
                 return app_add(slug, [],
                                url=typed if looks_like_url else None,
                                display=None if looks_like_url else typed)
-            return app_add(slug, [key])
+
+            have = {a["url"] for a in installed_apps().get(slug, [])}
+            opts = [(v[0], k) for k, v in sorted(WEBAPPS.items()) if v[1] not in have]
+            if not opts:
+                notify(f"every catalogue app is already installed for {name}")
+                return 0
+            key = pick(opts, f"Add a web app to {name}…")
+            return 0 if key is None else app_add(slug, [key])
 
         if sub in ("add", "remove"):
             if len(argv) < 3:
@@ -1346,6 +1368,14 @@ def main(argv):
                 return 2
             slug, keys = argv[2], argv[3:]
             raw = sys.argv[1:]
+            # A flag's VALUE does not start with "-", so it survives the flag
+            # strip above and would otherwise be read as a catalogue key.
+            for flag in ("--url", "--name", "--name-template"):
+                for i, a in enumerate(raw):
+                    if a == flag and i + 1 < len(raw):
+                        keys = [k for k in keys if k != raw[i + 1]]
+                    elif a.startswith(flag + "="):
+                        keys = [k for k in keys if k != a.split("=", 1)[1]]
             def flagval(name):
                 for i, a in enumerate(raw):
                     if a == name and i + 1 < len(raw):
