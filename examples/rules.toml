@@ -1,0 +1,43 @@
+# Forced overrides, checked BEFORE "reuse whatever is on this workspace".
+# First match wins. `profile` is an ego name or slug (see `omaego list`).
+#
+#   url     glob against the whole URL; '*' spans any characters
+#   match   host, matched exactly or as a domain suffix
+#           (prefix with "re:" for a regex over the whole URL)
+#   rewrite [pattern, replacement] applied before opening
+#   app     true opens an --app window instead of a tab
+#   source  only apply when the focused window's class matches
+#
+# Without any rules omaego is purely local: a link opens in whatever ego already
+# has a browser window on your current workspace, and asks when there is none.
+# Rules are for the cases you want forced regardless of where you are.
+
+# A customer's code host always belongs to the ego signed into it.
+[[rule]]
+url = "https://git.example.com/acme/*"
+profile = "Work"
+
+# A whole SaaS host, when one ego owns it outright.
+[[rule]]
+url = "https://acme.atlassian.net/*"
+profile = "Work"
+
+# Your own repositories, in your personal ego.
+[[rule]]
+url = "https://github.com/your-handle/*"
+profile = "Personal"
+
+[[rule]]
+url = "https://github.com/your-handle"
+profile = "Personal"
+
+# Zoom: rewrite a join link to the web client and open it as an app window.
+# No `profile`, so it still lands in whichever ego owns the current workspace.
+[[rule]]
+url = "https://*zoom.us/j/*"
+rewrite = ["^https?://[^/]*zoom\\.us/j/(\\d+)([?#].*)?$", "https://app.zoom.us/wc/join/\\1\\2"]
+app = true
+
+[[rule]]
+url = "https://app.zoom.us/wc/*"
+app = true

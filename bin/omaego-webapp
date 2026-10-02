@@ -1,0 +1,42 @@
+#!/bin/bash
+# Launch a Chrome web app pinned to one ego.
+#
+#   omaego-webapp --ego=<slug> --app=https://...     pin to one ego
+#   omaego-webapp --app=https://...                  use the fallback ego
+#
+# --profile= is accepted as an alias so launchers written against the older
+# chrome-webapp keep working.
+#
+# Why a wrapper at all: omarchy-launch-webapp keeps only the FIRST token of an
+# Exec= line and appends --app=<url>, so flags can never live in the .desktop
+# file. Per-ego web apps are installed with omarchy webapp install's custom-exec
+# argument, which does keep the whole command line:
+#
+#   omarchy webapp install "Teams Work" <url> "" \
+#     "$HOME/.local/bin/omaego-webapp --ego=work --app=<url>"
+ROOT="${OMAEGO_ROOT:-$HOME/.local/share/chrome-profiles}"
+SLUG=""
+ARGS=()
+for a in "$@"; do
+  case $a in
+    --ego=*)     SLUG="${a#--ego=}" ;;
+    --profile=*) SLUG="${a#--profile=}" ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+[ -z "$SLUG" ] && SLUG=$(cat "$ROOT/.default" 2>/dev/null)
+
+if [ -n "$SLUG" ] && [ -d "$ROOT/$SLUG" ]; then
+  PDIR=$(cat "$ROOT/$SLUG/.profile-dir" 2>/dev/null)
+  PD=()
+  [ -n "$PDIR" ] && [ "$PDIR" != "Default" ] && PD=(--profile-directory="$PDIR")
+  # --class matters even for an app window: if this is the first launch for the
+  # data dir it fixes the class of every BROWSER window that instance later
+  # opens (a link clicked inside the web app). Without it those windows come out
+  # as plain google-chrome and routing cannot tell which ego they belong to.
+  exec google-chrome-stable --user-data-dir="$ROOT/$SLUG" "${PD[@]}" \
+    --class="chrome-$SLUG" \
+    --no-first-run --no-default-browser-check "${ARGS[@]}"
+fi
+echo "omaego-webapp: unknown ego '$SLUG'" >&2
+exec google-chrome-stable --no-first-run --no-default-browser-check "${ARGS[@]}"

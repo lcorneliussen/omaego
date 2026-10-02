@@ -1,0 +1,863 @@
+#!/usr/bin/env python3
+"""Route URLs into Chrome profiles, preferring whatever is already on this desktop.
+
+Design notes (learned the hard way):
+  Chrome/Chromium keep one process per --user-data-dir. A launch that names an
+  already-running data dir is forwarded to that process over the singleton
+  socket, so --class is dropped and every window ends up as `google-chrome`.
+  Giving each profile its own --user-data-dir is therefore the only way to tell
+  from the outside which profile a window belongs to.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+from urllib.parse import urlsplit
+
+LOG = Path.home() / ".cache/omaego.log"
+
+
+def log(msg):
+    if os.environ.get("URLROUTER_LOG", "1") == "0":
+        return
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        if LOG.exists() and LOG.stat().st_size > 256_000:
+            LOG.unlink()
+        import datetime
+        with LOG.open("a") as f:
+            f.write(f"{datetime.datetime.now():%H:%M:%S} {msg}\n")
+    except Exception:
+        pass
+
+
+CHROME = "google-chrome-stable"
+
+# The ego root keeps its historical path: each ego is a Chrome --user-data-dir,
+# and moving them would break every installed .desktop and web app for no gain.
+EGO_ROOT = Path(os.environ.get("OMAEGO_ROOT",
+                               Path.home() / ".local/share/chrome-profiles"))
+PROFILE_ROOT = EGO_ROOT                     # internal alias, kept for clarity
+
+_RULES_NEW = Path.home() / ".config/omaego/rules.toml"
+_RULES_OLD = Path.home() / ".config/urlrouter/rules.toml"
+RULES = _RULES_NEW if _RULES_NEW.exists() or not _RULES_OLD.exists() else _RULES_OLD
+
+DEFAULT_MARK = EGO_ROOT / ".default"
+DESKTOP_DIR = Path.home() / ".local/share/applications"
+
+# Browsers we did not create but should still route into when one is on-screen.
+UNMANAGED = {
+    "google-chrome": ("Chrome (default)", Path.home() / ".config/google-chrome"),
+    "chromium": ("Chromium", Path.home() / ".config/chromium"),
+}
+# Windows that look like browsers but are somebody else's tool.
+IGNORED_CLASSES = {"chromium-browser"}
+
+
+# --- profiles ---------------------------------------------------------------
+
+NM_SOURCE = Path.home() / ".config/google-chrome/NativeMessagingHosts"
+
+
+def ensure_native_hosts(data_dir):
+    """Give a managed data dir the native-messaging manifests.
+
+    Chrome resolves user-level native messaging hosts relative to the
+    user-data-dir, so a custom data dir sees none of the manifests installed
+    into ~/.config/google-chrome - which silently breaks the 1Password desktop
+    app integration and Omarchy's copy-url / yt-dlp extensions. Symlink rather
+    than copy so vendor updates to a manifest reach every profile.
+    """
+    if not NM_SOURCE.is_dir():
+        return 0
+    dest = data_dir / "NativeMessagingHosts"
+    dest.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for manifest in NM_SOURCE.glob("*.json"):
+        link = dest / manifest.name
+        if link.is_symlink() or link.exists():
+            continue
+        try:
+            link.symlink_to(manifest)
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
+def default_slug():
+    """Profile that acts as plain 'Chrome': the launcher entry and web apps."""
+    try:
+        return DEFAULT_MARK.read_text().strip() or None
+    except Exception:
+        return None
+
+
+def slugify(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "profile"
+
+
+def profiles():
+    """Registered profiles, newest-listed last. slug -> dict."""
+    out = {}
+    for d in sorted(PROFILE_ROOT.glob("*/")):
+        if not d.is_dir():
+            continue
+        slug = d.name
+        namefile = d / ".profile-name"
+        name = namefile.read_text().strip() if namefile.exists() else slug.title()
+        dirfile = d / ".profile-dir"
+        inner = dirfile.read_text().strip() if dirfile.exists() else "Default"
+        out[slug] = {
+            "slug": slug,
+            "name": name,
+            "data_dir": d,
+            "wm_class": f"chrome-{slug}",
+            "profile_dir": inner,
+            "managed": True,
+        }
+    return out
+
+
+def all_targets():
+    """Profiles plus unmanaged browsers, keyed by wm_class."""
+    by_class = {}
+    for p in profiles().values():
+        by_class[p["wm_class"]] = p
+    for cls, (name, cfg) in UNMANAGED.items():
+        if not (cfg and cfg.exists()):
+            continue          # browser uninstalled / data dir removed
+        by_class.setdefault(cls, {
+            "slug": cls, "name": name, "data_dir": cfg,
+            "wm_class": cls, "profile_dir": "Default", "managed": False,
+        })
+    return by_class
+
+
+def internal_profiles(data_dir):
+    """Chrome-internal profiles inside one user-data-dir: [(subdir, display name)].
+
+    These all share a process, so their windows are indistinguishable from the
+    outside. They are listed only so `import` can lift one into its own data dir.
+    """
+    ls = data_dir / "Local State"
+    if not ls.exists():
+        return []
+    try:
+        cache = json.loads(ls.read_text()).get("profile", {}).get("info_cache", {})
+    except Exception:
+        return []
+    return sorted((k, v.get("name") or k) for k, v in cache.items())
+
+
+def chrome_running():
+    return subprocess.run(["pgrep", "-x", "chrome"], capture_output=True).returncode == 0
+
+
+def import_profile(data_dir, subdir, name=None):
+    """Copy a Chrome-internal profile out into its own user-data-dir."""
+    src = data_dir / subdir
+    if not src.is_dir():
+        raise SystemExit(f"no such profile directory: {src}")
+    if chrome_running():
+        raise SystemExit(
+            "Chrome is running - quit it completely first, or the copy will be "
+            "inconsistent (its databases are open)."
+        )
+    name = name or dict(internal_profiles(data_dir)).get(subdir, subdir)
+    slug = slugify(name)
+    dest = PROFILE_ROOT / slug
+    if dest.exists():
+        raise SystemExit(f"profile {slug!r} already exists at {dest}")
+    dest.mkdir(parents=True)
+    print(f"copying {src} -> {dest / 'Default'} ...")
+    subprocess.run(["cp", "-a", str(src), str(dest / "Default")], check=True)
+    (dest / ".profile-name").write_text(name + "\n")
+    ensure_native_hosts(dest)
+    write_desktop_entries()
+    print(f"imported {name!r} as {slug} (class chrome-{slug})")
+    print(f"original left in place at {src}")
+    return slug
+
+
+def add_profile(name):
+    slug = slugify(name)
+    d = PROFILE_ROOT / slug
+    if d.exists():
+        return slug
+    d.mkdir(parents=True)
+    (d / ".profile-name").write_text(name + "\n")
+    ensure_native_hosts(d)
+    write_desktop_entries()
+    return slug
+
+
+# --- hyprland ---------------------------------------------------------------
+
+def hyprctl(*args):
+    try:
+        r = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True, timeout=5)
+        return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+def dispatch(expr):
+    subprocess.run(["hyprctl", "dispatch", expr], capture_output=True, text=True, timeout=5)
+
+
+def current_workspace():
+    aw = hyprctl("activeworkspace")
+    return aw.get("id") if aw else None
+
+
+def window_data_dir(pid):
+    """--user-data-dir of a window's Chrome process, or None.
+
+    Chrome rewrites its own argv, so /proc/<pid>/cmdline comes back space
+    separated rather than NUL separated; normalise both.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    text = raw.replace(b"\0", b" ").decode("utf-8", "replace")
+    m = re.search(r"--user-data-dir=(\S+)", text)
+    return m.group(1).rstrip("/") if m else None
+
+
+def browsers_here():
+    """Browser presence on the active workspace: [(address, wm_class, focused)].
+
+    address is None for a web-app window (Teams, X, ...). Such a window still
+    says "this profile is on this desktop", but a link must never be opened
+    into it - a web app is a single-purpose window, not a place for tabs - so
+    it is never used as a reuse target, only as a hint about which profile.
+    """
+    ws = current_workspace()
+    clients = hyprctl("clients") or []
+    active = (hyprctl("activewindow") or {}).get("address")
+    known = all_targets()
+    by_dir = {str(t["data_dir"]).rstrip("/"): t["wm_class"]
+              for t in known.values() if t["managed"] and t["data_dir"]}
+    found = []
+    for c in clients:
+        cls = c.get("class", "")
+        if cls in IGNORED_CLASSES or c.get("workspace", {}).get("id") != ws:
+            continue
+        if not (cls in known or cls.startswith("chrome-") or cls == "google-chrome"):
+            continue
+        # Prefer the process's data dir over the window class: an instance first
+        # launched without --class (a web app at login, say) gives every browser
+        # window the anonymous class google-chrome, but its data dir is exact.
+        prof = by_dir.get(window_data_dir(c.get("pid")) or "")
+        if prof is None:
+            prof = cls if cls in known else None
+        if prof is None:
+            continue
+        # A web app window is a hint about which profile is on this desktop,
+        # never somewhere to put a link - Chrome cannot add a tab to an --app
+        # window and silently opens a whole new browser window instead.
+        # Detect by elimination: our own browser classes are exactly the known
+        # ones, so any other chrome-* class is an app window. Matching the class
+        # shape instead fails for apps whose URL has a path, e.g.
+        # chrome-outlook.office.com__mail_-Default.
+        is_app = cls.startswith("chrome-") and cls not in known
+        found.append((None if is_app else c["address"], prof,
+                      (not is_app) and c["address"] == active))
+    return found
+
+
+def focus(address, confirm=True):
+    """Focus a window and wait until the compositor reports it active.
+
+    hyprctl returns as soon as the dispatch is queued. Launching Chrome
+    immediately afterwards races the activation: Chrome still considers the
+    previously active window current, and if that was an app window (Teams,
+    Outlook) it cannot host a tab, so it opens a whole new browser window
+    instead of reusing the one we just picked.
+    """
+    dispatch(f"hl.dsp.focus({{ window = 'address:{address}' }})")
+    if not confirm:
+        return
+    for _ in range(20):                      # up to ~1s
+        if (hyprctl("activewindow") or {}).get("address") == address:
+            return
+        time.sleep(0.05)
+    log(f"focus: {address} did not become active in time")
+
+
+# --- picker -----------------------------------------------------------------
+
+def pick(options, prompt):
+    """options: list of (label, value). Returns value or None."""
+    if not options:
+        return None
+    labels = "\n".join(label for label, _ in options)
+    log(f"pick: offering {labels!r}")
+    try:
+        r = subprocess.run(
+            ["walker", "--dmenu", "-X", "--placeholder", prompt],
+            input=labels, capture_output=True, text=True, timeout=120,
+        )
+    except Exception as e:
+        log(f"pick: walker failed {e!r}")
+        return None
+    log(f"pick: rc={r.returncode} out={r.stdout!r} err={r.stderr[:200]!r}")
+    chosen = r.stdout.strip()
+    for label, value in options:
+        if label == chosen:
+            return value
+    log(f"pick: no option matched {chosen!r}")
+    return None
+
+
+def prompt_text(prompt):
+    try:
+        r = subprocess.run(
+            ["walker", "--dmenu", "--inputonly", "--placeholder", prompt],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+    except Exception:
+        return None
+    return r.stdout.strip() or None
+
+
+def notify(msg):
+    subprocess.run(["notify-send", "omaego", msg], capture_output=True)
+
+
+# --- rules ------------------------------------------------------------------
+
+def load_rules():
+    if not RULES.exists():
+        return []
+    try:
+        with RULES.open("rb") as f:
+            return tomllib.load(f).get("rule", [])
+    except Exception as e:
+        notify(f"rules.toml: {e}")
+        return []
+
+
+def glob_to_re(pattern):
+    """URL glob -> regex. '*' spans any characters; everything else is literal."""
+    return "^" + "".join(".*" if part == "*" else re.escape(part)
+                         for part in re.split(r"(\*)", pattern)) + "$"
+
+
+def match_rule(url, source_class):
+    host = (urlsplit(url).hostname or "").lower()
+    for r in load_rules():
+        want_source = r.get("source")
+        if want_source and want_source.lower() not in (source_class or "").lower():
+            continue
+        pat, m = r.get("url"), r.get("match")
+        if pat:
+            if not re.match(glob_to_re(pat), url):
+                continue
+        elif m:
+            if m.startswith("re:"):
+                if not re.search(m[3:], url):
+                    continue
+            elif not (host == m.lower() or host.endswith("." + m.lower())):
+                continue
+        elif not want_source:
+            continue
+        return r
+    return None
+
+
+# --- launching --------------------------------------------------------------
+
+def launch(target, url=None, new_window=False, incognito=False, as_app=False):
+    cmd = [CHROME, "--no-first-run", "--no-default-browser-check"]
+    if target["managed"]:
+        cmd += [f"--user-data-dir={target['data_dir']}", f"--class={target['wm_class']}"]
+        if target.get("profile_dir", "Default") != "Default":
+            cmd.append(f"--profile-directory={target['profile_dir']}")
+    if incognito:
+        cmd.append("--incognito")
+    elif as_app:
+        pass                      # an --app window is always its own window
+    elif new_window:
+        cmd.append("--new-window")
+    if url:
+        cmd.append(f"--app={url}" if as_app else url)
+    log(f"launch: {cmd}")
+    subprocess.Popen(cmd, start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def open_url(url=None, incognito=False):
+    by_class = all_targets()
+    if any(t["managed"] for t in by_class.values()):
+        # Once real profiles exist, the plain shared-data-dir Chrome is not a
+        # routing target: reusing it silently drops links into a nameless
+        # profile instead of asking.
+        by_class = {c: t for c, t in by_class.items() if t["managed"]}
+    here = [w for w in browsers_here() if w[1] in by_class]
+
+    # 1. An explicit rule wins, but still opens on this desktop.
+    source_class = next((cls for _, cls, foc in here if foc), None)
+    rule = match_rule(url, source_class) if url else None
+    as_app = bool(rule and rule.get("app"))
+    if rule and rule.get("rewrite"):
+        pat, repl = rule["rewrite"]
+        new_url = re.sub(pat, repl, url)
+        if new_url != url:
+            log(f"rewrite: {url} -> {new_url}")
+            url = new_url
+    wanted = rule.get("profile") if rule else None
+    target = None
+    if wanted:
+        slug = slugify(wanted)
+        target = next((t for t in by_class.values()
+                       if t["slug"] == slug or t["name"].lower() == wanted.lower()), None)
+        if target is None:
+            notify(f"rule points at unknown profile {wanted!r}")
+
+    # 2. Otherwise prefer a browser already on this desktop.
+    if target is None and here:
+        focused = [cls for _, cls, foc in here if foc]
+        distinct = {cls for _, cls, _ in here}
+        if focused:
+            target = by_class[focused[0]]
+        elif len(distinct) == 1:
+            target = by_class[distinct.pop()]
+        else:
+            target = pick([(by_class[c]["name"], by_class[c]) for c in sorted(distinct)],
+                          "Open link in…")
+            if target is None:
+                return
+
+    # 3. Nothing here: ask which profile to start on this desktop.
+    if target is None:
+        opts = [(t["name"], t) for t in by_class.values()]
+        opts.sort(key=lambda o: (not o[1]["managed"], o[0]))
+        opts.append(("+ New profile…", "__new__"))
+        chosen = pick(opts, "No browser on this desktop — open link in…")
+        if chosen is None:
+            return
+        if chosen == "__new__":
+            name = prompt_text("Name for the new profile")
+            if not name:
+                return
+            target = profiles()[add_profile(name)]
+        else:
+            target = chosen
+
+    # Focus the profile's window on this desktop so the tab lands here, not on
+    # whatever desktop that profile last had focus on.
+    addr = next((a for a, cls, _ in here if cls == target["wm_class"] and a), None)
+    if as_app:
+        launch(target, url, as_app=True)
+    elif incognito:
+        launch(target, url, incognito=True)
+    elif url:
+        # Focus first so the tab lands on this desktop, not wherever that
+        # profile last had focus.
+        if addr:
+            focus(addr)
+            launch(target, url)
+        else:
+            launch(target, url, new_window=True)
+    elif addr:
+        focus(addr)          # plain "open browser" and one is already here
+    else:
+        launch(target, new_window=True)
+
+
+# --- desktop entries --------------------------------------------------------
+
+def write_desktop_entries():
+    DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
+    me = os.environ.get("OMAEGO_BIN", str(Path.home() / ".local/bin/omaego"))
+    (DESKTOP_DIR / "omaego.desktop").write_text(f"""[Desktop Entry]
+Type=Application
+Name=omaego
+Comment=Open links in the ego whose browser is already on this desktop
+Exec={me} %u
+Icon=google-chrome
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;
+""")
+    dflt = default_slug()
+    for slug, p in profiles().items():
+        ensure_native_hosts(p["data_dir"])
+        is_default = slug == dflt
+        # The default profile owns the plain "Google Chrome" entry, and its own
+        # per-profile entry is hidden so the launcher does not show both.
+        (DESKTOP_DIR / f"chrome-{slug}.desktop").write_text(f"""[Desktop Entry]
+Type=Application
+Name=Chrome {p['name']}
+Exec={me} launch {slug} %U
+Icon=google-chrome
+Terminal=false
+StartupWMClass={p['wm_class']}
+Categories=Network;WebBrowser;
+{"NoDisplay=true" if is_default else ""}
+""")
+        if is_default:
+            (DESKTOP_DIR / "google-chrome.desktop").write_text(f"""[Desktop Entry]
+Type=Application
+Name=Google Chrome
+Comment=Personal profile ({p['name']})
+Exec={me} launch {slug} %U
+Icon=google-chrome
+Terminal=false
+StartupWMClass={p['wm_class']}
+Categories=Network;WebBrowser;
+""")
+    subprocess.run(["update-desktop-database", str(DESKTOP_DIR)], capture_output=True)
+
+
+
+# --- web app catalogue ------------------------------------------------------
+
+ICON_DIR = Path.home() / ".local/share/icons/hicolor/256x256/apps"
+APP_NAME_TEMPLATE = os.environ.get("OMAEGO_APP_NAME", "{app} {ego}")
+
+_G = "https://www.gstatic.com/images/branding/product/2x/{}_2020q4_512dp.png"
+
+# key: (display name, url, rule domain or None, icon url or None)
+# A rule domain is only suggested where one ego plausibly owns the whole host.
+WEBAPPS = {
+    "teams":    ("Teams",     "https://teams.microsoft.com/",     "teams.microsoft.com", None),
+    "outlook":  ("Outlook",   "https://outlook.office.com/mail/", None,                  None),
+    "office":   ("Office",    "https://www.office.com/",          None,                  None),
+    "gmail":    ("Gmail",     "https://mail.google.com/",         None,  _G.format("gmail")),
+    "gcal":     ("Calendar",  "https://calendar.google.com/",     None,  _G.format("calendar")),
+    "gchat":    ("Chat",      "https://chat.google.com/",         None,  _G.format("chat")),
+    "gdrive":   ("Drive",     "https://drive.google.com/",        None,  _G.format("drive")),
+    "gdocs":    ("Docs",      "https://docs.google.com/",         None,  _G.format("docs")),
+    "meet":     ("Meet",      "https://meet.google.com/",         "meet.google.com", _G.format("meet")),
+    "keep":     ("Keep",      "https://keep.google.com/",         "keep.google.com", _G.format("keep")),
+    "slack":    ("Slack",     "https://app.slack.com/client",     None,                  None),
+    "zoom":     ("Zoom",      "https://app.zoom.us/wc/home",      None,                  None),
+    "whatsapp": ("WhatsApp",  "https://web.whatsapp.com/",        "web.whatsapp.com",    None),
+    "github":   ("GitHub",    "https://github.com/",              None,                  None),
+    "linear":   ("Linear",    "https://linear.app/",              "linear.app",          None),
+    "notion":   ("Notion",    "https://www.notion.so/",           "notion.so",           None),
+    "figma":    ("Figma",     "https://www.figma.com/files",      "figma.com",           None),
+    "chatgpt":  ("ChatGPT",   "https://chatgpt.com/",             "chatgpt.com",         None),
+    "claude":   ("Claude",    "https://claude.ai/",               "claude.ai",           None),
+}
+
+
+def normalize_icon(path):
+    """Make an icon a 256px transparent PNG, whatever the site served.
+
+    Omarchy's fetcher happily writes a JPEG under a .png name (Outlook) or a
+    64px favicon into the 256px directory (Google Chat). A JPEG has no alpha, so
+    it shows as a solid white tile on a dark bar. Flood-fill from the corner
+    rather than keying on white, so white *inside* a logo survives.
+    """
+    if not path.exists() or not shutil.which("magick"):
+        return False
+    kind = subprocess.run(["file", "-b", str(path)], capture_output=True,
+                          text=True).stdout
+    args = ["magick", str(path), "-alpha", "set"]
+    if "JPEG" in kind:                      # opaque source: lift the backdrop
+        args += ["-bordercolor", "white", "-border", "1",
+                 "-fuzz", "8%", "-fill", "none", "-floodfill", "+0+0", "white",
+                 "-shave", "1x1"]
+    args += ["-resize", "256x256", f"PNG32:{path}"]
+    return subprocess.run(args, capture_output=True).returncode == 0
+
+
+def fetch_icon(url, dest):
+    try:
+        r = subprocess.run(["curl", "-fsSL", "--max-time", "10", "-o", str(dest), url],
+                           capture_output=True)
+        return r.returncode == 0 and dest.exists() and dest.stat().st_size > 0
+    except Exception:
+        return False
+
+
+def app_rule_conflict(domain):
+    """Which ego, if any, already claims this domain in rules.toml."""
+    if not domain:
+        return None
+    for r in load_rules():
+        pat = r.get("url") or r.get("match") or ""
+        if domain in pat:
+            return r.get("profile")
+    return None
+
+
+def append_rule(domain, ego_name):
+    with RULES.open("a") as f:
+        f.write(f'\n[[rule]]\nurl = "https://*{domain}/*"\nprofile = "{ego_name}"\n')
+
+
+def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=True):
+    egos = profiles()
+    if slug not in egos:
+        print(f"unknown ego {slug!r} (see: omaego list)", file=sys.stderr)
+        return 1
+    ego = egos[slug]
+    bin_webapp = os.environ.get("OMAEGO_WEBAPP",
+                                str(Path.home() / ".local/bin/omaego-webapp"))
+    tpl = name_tpl or APP_NAME_TEMPLATE
+    ICON_DIR.mkdir(parents=True, exist_ok=True)
+
+    items = []
+    if url:
+        items.append((display or urlsplit(url).hostname or "App", url, None, None))
+    for k in keys:
+        if k not in WEBAPPS:
+            print(f"unknown app {k!r} (see: omaego app list)", file=sys.stderr)
+            return 1
+        items.append(WEBAPPS[k])
+
+    for app_name, app_url, domain, icon_url in items:
+        name = tpl.format(app=app_name, ego=ego["name"])
+        icon_slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        icon_arg = ""
+        if icon_url:
+            dest = ICON_DIR / f"{icon_slug}.png"
+            if fetch_icon(icon_url, dest) and normalize_icon(dest):
+                icon_arg = icon_slug          # a bare name is used as-is
+        exec_line = f"{bin_webapp} --ego={slug} --app={app_url}"
+        r = subprocess.run(["omarchy", "webapp", "install", name, app_url,
+                            icon_arg, exec_line], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"  {name}: FAILED  {r.stderr.strip()[:120]}", file=sys.stderr)
+            continue
+        if not icon_arg:                       # omarchy fetched it; fix it up
+            normalize_icon(ICON_DIR / f"{icon_slug}.png")
+        print(f"  installed  {name}")
+
+        if want_rule and domain:
+            owner = app_rule_conflict(domain)
+            if owner and owner.lower() != ego["name"].lower():
+                print(f"      rule skipped: {domain} already routes to {owner!r}")
+            elif owner:
+                print(f"      rule exists:  {domain} -> {owner}")
+            else:
+                append_rule(domain, ego["name"])
+                print(f"      rule added:   https://*{domain}/* -> {ego['name']}")
+        elif want_rule and not domain:
+            print(f"      no rule: this host is shared between egos, "
+                  f"so routing it would be ambiguous")
+    return 0
+
+
+# --- cli --------------------------------------------------------------------
+
+USAGE = """omaego - keep work, private and customer contexts apart in one browser
+
+An *ego* is one Chrome --user-data-dir: its own process, window class, cookie
+jar and sync account. A workspace usually belongs to one ego. A link always
+opens on the workspace you are on - never by switching desktops.
+
+  omaego <url>           route a URL (this is what the desktop entry calls)
+  omaego                 open a browser on this desktop
+  omaego list            show egos, and which Chrome-internal profiles are not
+                         routable on their own
+  omaego add <name>      create an empty ego
+  omaego import <src> [name]
+                         lift a Chrome-internal profile into its own ego
+                         (needs Chrome fully quit)
+  omaego launch <slug> [url]
+  omaego default [slug]  show/set the FALLBACK ego: the one that owns plain
+                         "Google Chrome" and web apps. Not an "active" ego -
+                         there is no such thing; the workspace is the unit.
+  omaego space [--json]  which ego owns the current workspace
+  omaego here [--json]   browser and web-app windows on the current workspace
+  omaego sync            rewrite desktop entries, relink native messaging hosts
+  omaego restructure     name each inner profile dir after its ego, so web-app
+                         windows identify their ego (rarely needed)
+
+Flags: --incognito / --private / --private-window / --inprivate
+Rules: ~/.config/omaego/rules.toml
+"""
+
+
+# Read-only queries the bar widget polls several times a minute. Logging them
+# would churn the routing history out of the log's size cap within the hour.
+QUIET = {"space", "here", "list", "default", "--help", "-h"}
+
+
+def main(argv):
+    if not (argv and argv[0] in QUIET):
+        log(f"argv={argv}")
+
+    # Callers probe browsers with --help (omarchy-launch-browser greps it to
+    # detect Firefox); never treat a flag as a URL.
+    if any(a in ("--help", "-h", "-help") for a in argv):
+        print(USAGE)
+        return 0
+
+    want_json = "--json" in argv
+    incognito = any(a in ("--incognito", "--private", "--private-window",
+                          "--inprivate") for a in argv)
+    argv = [a for a in argv if not a.startswith("-")]
+
+    if not argv:
+        open_url(None, incognito=incognito)
+        return 0
+    cmd = argv[0]
+
+    if cmd == "list":
+        by_class = all_targets()
+        for t in sorted(by_class.values(), key=lambda t: (not t["managed"], t["name"])):
+            kind = "routable" if t["managed"] else "shared data dir"
+            print(f"{t['name']:<24} class={t['wm_class']:<22} {kind}")
+            if not t["managed"] and t["data_dir"]:
+                inner = internal_profiles(t["data_dir"])
+                for sub, nm in inner:
+                    print(f"    - {nm:<20} ({sub})  NOT routable on its own")
+                if len(inner) > 1:
+                    print(f"    ^ these share one data dir, so every window is "
+                          f"class {t['wm_class']!r}.")
+                    print(f"      Lift one out with:  omaego import "
+                          f"{t['slug']} '<name>'")
+        return 0
+
+    if cmd == "import":
+        by_class = all_targets()
+        if len(argv) < 2:
+            print("usage: omaego import <google-chrome|chromium> [ego name]",
+                  file=sys.stderr)
+            return 2
+        src = by_class.get(argv[1])
+        if src is None or not src["data_dir"]:
+            print(f"unknown source {argv[1]!r}", file=sys.stderr)
+            return 1
+        inner = internal_profiles(src["data_dir"])
+        if len(argv) < 3:
+            print(f"egos inside {src['data_dir']}:")
+            for sub, nm in inner:
+                print(f"  {nm}   ({sub})")
+            return 0
+        want = " ".join(argv[2:])
+        match = [(sub, nm) for sub, nm in inner
+                 if nm.lower() == want.lower() or sub.lower() == want.lower()]
+        if not match:
+            print(f"no ego named {want!r}; try: omaego import {argv[1]}",
+                  file=sys.stderr)
+            return 1
+        import_profile(src["data_dir"], match[0][0], match[0][1])
+        return 0
+
+    if cmd == "add":
+        if len(argv) < 2:
+            print("usage: urlrouter add <name>", file=sys.stderr)
+            return 2
+        slug = add_profile(" ".join(argv[1:]))
+        print(f"added {slug}")
+        return 0
+
+    if cmd == "launch":
+        if len(argv) < 2:
+            return 2
+        by_class = all_targets()
+        t = next((t for t in by_class.values() if t["slug"] == argv[1]), None)
+        if t is None:
+            print(f"unknown profile {argv[1]!r}", file=sys.stderr)
+            return 1
+        launch(t, argv[2] if len(argv) > 2 else None, new_window=True)
+        return 0
+
+    if cmd == "default":
+        if len(argv) < 2:
+            print(default_slug() or "(none)")
+            return 0
+        if argv[1] not in profiles():
+            print(f"unknown profile {argv[1]!r}", file=sys.stderr)
+            return 1
+        DEFAULT_MARK.write_text(argv[1] + "\n")
+        write_desktop_entries()
+        print(f"default profile -> {argv[1]}")
+        return 0
+
+    if cmd == "restructure":
+        # Rename each data dir's inner profile from "Default" to the profile's
+        # own name, so web-app windows come out as chrome-<app>__-<Name> and can
+        # be attributed to a profile (and no longer collide between profiles).
+        if chrome_running():
+            print("Quit Chrome completely first - renaming a profile directory "
+                  "under a running instance corrupts it.", file=sys.stderr)
+            return 1
+        changed = 0
+        for slug, prof in profiles().items():
+            if prof["profile_dir"] != "Default":
+                print(f"  {slug}: already {prof['profile_dir']}")
+                continue
+            inner = re.sub(r"[^A-Za-z0-9]", "", prof["name"]) or slug.title()
+            src, dst = prof["data_dir"] / "Default", prof["data_dir"] / inner
+            if not src.is_dir():
+                print(f"  {slug}: no Default dir, skipped", file=sys.stderr)
+                continue
+            if dst.exists():
+                print(f"  {slug}: {inner} already exists, skipped", file=sys.stderr)
+                continue
+            src.rename(dst)                      # same filesystem: instant
+            (prof["data_dir"] / ".profile-dir").write_text(inner + "\n")
+            print(f"  {slug}: Default -> {inner}")
+            changed += 1
+        if changed:
+            write_desktop_entries()
+        print(f"{changed} profile(s) restructured")
+        return 0
+
+    if cmd == "sync":
+        write_desktop_entries()
+        print("desktop entries written")
+        return 0
+
+    if cmd == "here":
+        rows = browsers_here()
+        if want_json:
+            print(json.dumps([{"address": a, "class": c, "focused": f,
+                               "webapp": a is None} for a, c, f in rows]))
+            return 0
+        for a, cls, foc in rows:
+            kind = "webapp" if a is None else "browser"
+            print(f"{a or '-':<18} {kind:<8} {cls}{' (focused)' if foc else ''}")
+        return 0
+
+    if cmd == "space":
+        # A space usually belongs to ONE ego. Report which, from what is on it.
+        # There is no global "active ego" - the workspace is the unit.
+        by_class = all_targets()
+        rows = browsers_here()
+        egos, has_browser = [], set()
+        for a, cls, _ in rows:
+            t = by_class.get(cls)
+            name = t["name"] if t else cls
+            if name not in egos:
+                egos.append(name)
+            if a is not None:
+                has_browser.add(name)
+        state = ("empty" if not egos else
+                 "single" if len(egos) == 1 else "mixed")
+        out = {"workspace": current_workspace(), "state": state, "egos": egos,
+               "withBrowser": sorted(has_browser),
+               "fallback": (profiles().get(default_slug() or "") or {}).get("name")}
+        if want_json:
+            print(json.dumps(out))
+        elif state == "empty":
+            print(f"workspace {out['workspace']}: no ego here "
+                  f"(a link would ask; fallback is {out['fallback']})")
+        else:
+            print(f"workspace {out['workspace']}: {', '.join(egos)}"
+                  + ("" if has_browser else "  (web app only - a link opens a new window)"))
+        return 0
+
+    open_url(cmd, incognito=incognito)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

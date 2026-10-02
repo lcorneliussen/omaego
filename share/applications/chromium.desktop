@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Chromium (omaego shim → Chrome)
+Comment=omarchy-launch-webapp falls back to this entry for any default browser
+Comment[1]=it does not recognise; it points at omaego-webapp so web apps get an ego.
+Exec=__BIN__/omaego-webapp %U
+Icon=google-chrome
+Terminal=false
+NoDisplay=true
+Categories=Network;WebBrowser;
