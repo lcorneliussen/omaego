@@ -111,7 +111,8 @@ The binaries are symlinks **into the repo**, so do not delete the checkout.
 omaego app list                           # the catalogue
 omaego app add work teams outlook         # -> "Teams Work", "Outlook Work"
 omaego app add personal gmail gcal gchat
-omaego app add work --url https://acme.example.com/ --name "Acme"
+omaego app add work --url https://jira.acme.io      # name offered: "Jira"
+omaego app add work --name "Acme Wiki"              # asks for the URL
 ```
 
 Each app becomes its own window, signed into that ego, with a real icon. The

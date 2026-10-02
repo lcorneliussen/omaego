@@ -749,7 +749,32 @@ def append_rule(domain, ego_name):
         f.write(f'\n[[rule]]\nurl = "https://*{domain}/*"\nprofile = "{ego_name}"\n')
 
 
+def name_from_url(url):
+    """A sensible app name from a URL: the registrable part of the host."""
+    host = (urlsplit(url).hostname or "").lower().lstrip("www.")
+    parts = [p for p in host.split(".") if p not in ("com", "org", "net", "io",
+                                                     "app", "co", "www")]
+    # The first meaningful label, not the registrable domain: internal tools are
+    # named by their subdomain (jira.acme.io is "Jira", not "Acme").
+    return (parts[0] if parts else host).replace("-", " ").title()
+
+
+def normalize_url(url):
+    if url and not re.match(r"^[a-z][a-z0-9+.-]*://", url, re.I):
+        url = "https://" + url
+    return url
+
+
 def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False):
+    # One of url/name is enough; ask for whatever is missing.
+    if url and not display:
+        display = prompt_text(f"Name for {urlsplit(normalize_url(url)).hostname}") \
+            or name_from_url(normalize_url(url))
+    elif display and not url:
+        url = prompt_text(f"URL for {display}")
+        if not url:
+            return 1
+    url = normalize_url(url) if url else None
     egos = profiles()
     if slug not in egos:
         print(f"unknown ego {slug!r} (see: omaego list)", file=sys.stderr)
@@ -826,6 +851,8 @@ opens on the workspace you are on - never by switching desktops.
   omaego rule add <url-glob> <ego> [--app]
   omaego app list        web apps you can pin to an ego
   omaego app add <ego> <app>...   install them (--rule also routes that host)
+  omaego app add <ego> --url <url> | --name <name>
+                         either one is enough; you are asked for the other
   omaego app remove <ego> <app>...
   omaego launch <slug> [url]
   omaego default [slug]  show/set the FALLBACK ego: the one that owns plain
@@ -1126,11 +1153,20 @@ def main(argv):
             have = {a["url"] for a in installed_apps().get(slug, [])}
             opts = [(f"{v[0]}", k) for k, v in sorted(WEBAPPS.items())
                     if v[1] not in have]
-            if not opts:
-                notify(f"every catalogue app is already installed for {slug}")
-                return 0
+            opts.append(("+ Any URL…", "__custom__"))
             key = pick(opts, f"Add a web app to {profiles()[slug]['name']}…")
-            return 0 if key is None else app_add(slug, [key])
+            if key is None:
+                return 0
+            if key != "__custom__":
+                return app_add(slug, [key])
+            # Accept either a URL or a name; ask for the other.
+            first = prompt_text("URL, or a name if you would rather start there")
+            if not first:
+                return 0
+            looks_like_url = "." in first and " " not in first
+            return app_add(slug, [],
+                           url=first if looks_like_url else None,
+                           display=None if looks_like_url else first)
 
         if sub in ("add", "remove"):
             if len(argv) < 3:
