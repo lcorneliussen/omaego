@@ -32,12 +32,12 @@ Panel {
   readonly property var rules: model.rules || []
   readonly property var hereEgos: egos.filter(function (e) { return e.here })
   readonly property bool mixed: hereEgos.length > 1
-  // One ego owns a workspace in the normal case; more than one is worth naming
-  // as such rather than listing, which would make the bar jump around in width.
-  readonly property string label: hereEgos.length === 0 ? ""
-    : hereEgos.length === 1 ? hereEgos[0].name : "mixed"
+  readonly property string label: hereEgos.map(function (e) { return e.name }).join(" · ")
   readonly property real iconPx: Math.max(10, Math.round(barSize * 0.52))
   readonly property real ringPx: Math.max(1, Math.round(iconPx * 0.1))
+  // nf-md-account (U+F0004), outside the BMP so it needs a surrogate pair
+  readonly property string faceGlyph: "\udb80\udc04"
+  readonly property string iconFont: setting("iconFont", "JetBrainsMono Nerd Font")
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(fg, 1.6)
@@ -108,6 +108,41 @@ Panel {
           height: mark.height
           radius: mark.width / 2
           color: "#ffffff"
+        }
+      }
+      // The face, knocked out in the opposite colour on each half. Splitting a
+      // glyph's own colours instead does not work: the dark half loses its edge
+      // against a dark bar and reads as a rendering fault.
+      Item {
+        width: parent.width / 2
+        height: parent.height
+        clip: true
+        Text {
+          width: mark.width
+          height: mark.height
+          text: root.faceGlyph
+          color: "#000000"
+          font.family: root.iconFont
+          font.pixelSize: Math.round(root.iconPx * 0.62)
+          horizontalAlignment: Text.AlignHCenter
+          verticalAlignment: Text.AlignVCenter
+        }
+      }
+      Item {
+        x: parent.width / 2
+        width: parent.width / 2
+        height: parent.height
+        clip: true
+        Text {
+          x: -mark.width / 2
+          width: mark.width
+          height: mark.height
+          text: root.faceGlyph
+          color: "#ffffff"
+          font.family: root.iconFont
+          font.pixelSize: Math.round(root.iconPx * 0.62)
+          horizontalAlignment: Text.AlignHCenter
+          verticalAlignment: Text.AlignVCenter
         }
       }
       Rectangle {
