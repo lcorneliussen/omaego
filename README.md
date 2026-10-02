@@ -44,7 +44,8 @@ omaego import google-chrome "Acme"   # copies it out; the original stays as a ro
 
 1. **A rule in `~/.config/omaego/rules.toml`** → that ego, forced.
 2. **A browser window of some ego already on this workspace** → reuse it,
-   as a tab.
+   as a tab. If the workspace holds several egos, the one whose window comes
+   **first in the tiling** wins — no prompt.
 3. **Otherwise** → ask, with a picker of your egos.
 
 A web-app window (Teams, Outlook, Chat) counts for step 2 as a *hint* about

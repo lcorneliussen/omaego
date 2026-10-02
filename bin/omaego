@@ -248,6 +248,10 @@ def browsers_here():
     by_dir = {str(t["data_dir"]).rstrip("/"): t["wm_class"]
               for t in known.values() if t["managed"] and t["data_dir"]}
     found = []
+    # Reading order, so the ego whose window sits first in the tiling is named
+    # first - and is therefore the one a link defaults to.
+    clients = sorted(clients, key=lambda c: (c.get("at", [0, 0])[1],
+                                             c.get("at", [0, 0])[0]))
     for c in clients:
         cls = c.get("class", "")
         if cls in IGNORED_CLASSES or c.get("workspace", {}).get("id") != ws:
@@ -448,6 +452,28 @@ def remove_rule(pattern):
     return False
 
 
+HILITE = "rgb(f7768e)"
+
+
+def highlight(slug=None):
+    """Outline an ego's windows on this workspace; with no slug, clear all.
+
+    Used by the bar label on hover. Every window is cleared first so a missed
+    mouse-leave cannot leave a stray border behind.
+    """
+    want = profiles().get(slug or "", {}).get("wm_class")
+    for c in hyprctl("clients") or []:
+        if not (c.get("class", "").startswith("chrome-")
+                or c.get("class") == "google-chrome"):
+            continue
+        on = want is not None and c.get("class") == want
+        for prop, val in (("border_size", 4 if on else "unset"),
+                          ("active_border_color", HILITE if on else "unset"),
+                          ("inactive_border_color", HILITE if on else "unset")):
+            dispatch(f"hl.dsp.window.set_prop({{ window = 'address:{c['address']}', "
+                     f"prop = '{prop}', value = {val if val == 4 else repr(val)} }})")
+
+
 def ego_options(by_class, first=()):
     """Picker rows: every ego, the ones on this desktop first.
 
@@ -512,16 +538,10 @@ def open_url(url=None, incognito=False):
         elif len(distinct) == 1:
             target = by_class[distinct.pop()]
         else:
-            # Egos already on this desktop come first - on a mixed workspace one
-            # of them is almost always the answer, and walker binds F1/F2 to the
-            # top rows. The rest still have to be offered: otherwise a link can
-            # never be sent to an ego that happens to have no window here.
-            chosen = pick(ego_options(by_class, first=distinct), "Open link in…")
-            if chosen is None:
-                return
-            target = resolve_choice(chosen)
-            if target is None:
-                return
+            # More than one ego here: take the first in tiling order rather than
+            # interrupting with a picker. A rule still overrides, and the picker
+            # remains for a workspace with no ego at all.
+            target = by_class[next(cls for _, cls, _ in here)]
 
     # 3. Nothing here: ask which ego to start on this desktop.
     if target is None:
@@ -772,7 +792,7 @@ Rules: ~/.config/omaego/rules.toml
 
 # Read-only queries the bar widget polls several times a minute. Logging them
 # would churn the routing history out of the log's size cap within the hour.
-QUIET = {"space", "here", "list", "default", "panel", "--help", "-h"}
+QUIET = {"space", "here", "list", "default", "panel", "highlight", "--help", "-h"}
 
 
 def main(argv):
@@ -1090,6 +1110,10 @@ def main(argv):
         for a, cls, foc in rows:
             kind = "webapp" if a is None else "browser"
             print(f"{a or '-':<18} {kind:<8} {cls}{' (focused)' if foc else ''}")
+        return 0
+
+    if cmd == "highlight":
+        highlight(argv[1] if len(argv) > 1 and argv[1] != "off" else None)
         return 0
 
     if cmd == "panel":

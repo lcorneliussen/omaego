@@ -33,7 +33,7 @@ Panel {
   readonly property var hereEgos: egos.filter(function (e) { return e.here })
   readonly property bool mixed: hereEgos.length > 1
   readonly property string label: hereEgos.map(function (e) { return e.name }).join(" · ")
-  readonly property real iconPx: Math.max(10, Math.round(barSize * 0.52))
+  readonly property real iconPx: Math.max(10, Math.round(barSize * 0.78))
   readonly property real ringPx: Math.max(1, Math.round(iconPx * 0.1))
   // nf-md-account (U+F0004), outside the BMP so it needs a surrogate pair
   readonly property string faceGlyph: "\udb80\udc04"
@@ -131,14 +131,41 @@ Panel {
       }
     }
 
-    Text {
-      id: labelText
-      visible: root.label !== "" && !root.vertical
+    // One item per ego so each name can be hovered on its own. Hovering
+    // outlines that ego's windows - the quickest way to see which tiles on a
+    // mixed workspace belong to whom.
+    Row {
+      id: labelRow
+      visible: !root.vertical
       anchors.verticalCenter: parent.verticalCenter
-      text: root.label
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      color: root.mixed && root.bar ? root.bar.urgent : root.fg
+      spacing: 0
+
+      Repeater {
+        model: root.hereEgos
+        Row {
+          spacing: 0
+          Text {
+            text: index === 0 ? "" : " · "
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+          Text {
+            text: modelData.name
+            color: hover.containsMouse && root.bar ? root.bar.urgent : root.fg
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            MouseArea {
+              id: hover
+              anchors.fill: parent
+              hoverEnabled: true
+              onEntered: root.run([root.omaego, "highlight", modelData.slug])
+              onExited: root.run([root.omaego, "highlight", "off"])
+              onClicked: root.toggle()
+            }
+          }
+        }
+      }
     }
   }
   MouseArea {
