@@ -20,6 +20,16 @@ system into; it is an identity that happens to have windows on a workspace. A
 workspace usually belongs to one ego, and links resolve inside the workspace
 they were clicked from.
 
+## Vocabulary
+
+| term | means |
+|---|---|
+| **ego** | one identity: its own Chrome `--user-data-dir`, window class, cookie jar, extensions and sync account |
+| **ego card** | one ego's row in the bar panel — its colour chip, name, web apps, and the actions that apply to it *on the current workspace* (`+app`, `✕`) |
+| **the mark** | the split-person icon in the bar; the label beside it names the egos on this workspace |
+| **the panel** | the popout from the mark, listing every ego card and the rules |
+| **fallback ego** | the one that owns plain "Google Chrome" and web apps launched without an ego. Not an "active" ego — there is no such thing |
+
 ## Setting up an ego
 
 ```bash

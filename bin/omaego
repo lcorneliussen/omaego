@@ -555,6 +555,34 @@ def highlight(mode=None):
         subprocess.run(["hyprctl", "--batch", " ; ".join(cmds)], capture_output=True)
 
 
+def close_ego(slug):
+    """Close every window of one ego on the current workspace.
+
+    Resolved by data dir, so an ego's web apps (Teams, Outlook) close with it -
+    they are windows of the same Chrome instance and belong to the same ego.
+    Other workspaces are untouched: this is the ego card's close button, and the
+    card describes this workspace.
+    """
+    prof = profiles().get(slug)
+    if not prof:
+        return 0
+    ws = current_workspace()
+    want_dir = str(prof["data_dir"]).rstrip("/")
+    cmds = []
+    for c in hyprctl("clients") or []:
+        if c.get("workspace", {}).get("id") != ws:
+            continue
+        cls = c.get("class", "")
+        if not (cls.startswith("chrome-") or cls == "google-chrome"):
+            continue
+        if window_data_dir(c.get("pid")) == want_dir or cls == prof["wm_class"]:
+            cmds.append(f"dispatch hl.dsp.window.close({{ window = "
+                        f"'address:{c['address']}' }})")
+    if cmds:
+        subprocess.run(["hyprctl", "--batch", " ; ".join(cmds)], capture_output=True)
+    return len(cmds)
+
+
 def ego_options(by_class, first=()):
     """Picker rows: every ego, the ones on this desktop first.
 
@@ -928,6 +956,7 @@ opens on the workspace you are on - never by switching desktops.
   omaego default [slug]  show/set the FALLBACK ego: the one that owns plain
                          "Google Chrome" and web apps. Not an "active" ego -
                          there is no such thing; the workspace is the unit.
+  omaego close <ego>     close that ego's windows on this workspace
   omaego space [--json]  which ego owns the current workspace
   omaego here [--json]   browser and web-app windows on the current workspace
   omaego sync            rewrite desktop entries, relink native messaging hosts
@@ -1288,6 +1317,14 @@ def main(argv):
         for a, cls, foc in rows:
             kind = "webapp" if a is None else "browser"
             print(f"{a or '-':<18} {kind:<8} {cls}{' (focused)' if foc else ''}")
+        return 0
+
+    if cmd == "close":
+        if len(argv) < 2:
+            print("usage: omaego close <ego>", file=sys.stderr)
+            return 2
+        n = close_ego(argv[1])
+        print(f"closed {n} window(s) of {argv[1]} on this workspace")
         return 0
 
     if cmd == "learn":
