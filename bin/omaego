@@ -396,6 +396,58 @@ def launch(target, url=None, new_window=False, incognito=False, as_app=False):
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def installed_apps():
+    """Web apps on disk, grouped by ego slug, read back from their .desktop."""
+    out = {}
+    for f in sorted(DESKTOP_DIR.glob("*.desktop")):
+        try:
+            txt = f.read_text()
+        except OSError:
+            continue
+        m = re.search(r"^Exec=(.*)$", txt, re.M)
+        if not m or ("omaego-webapp" not in m.group(1)
+                     and "chrome-webapp" not in m.group(1)):
+            continue
+        ego = re.search(r"--(?:ego|profile)=(\S+)", m.group(1))
+        app = re.search(r"--app=(\S+)", m.group(1))
+        if not ego or not app:
+            continue
+        name = (re.search(r"^Name=(.*)$", txt, re.M) or [None, f.stem])[1]
+        icon = (re.search(r"^Icon=(.*)$", txt, re.M) or [None, ""])[1]
+        key = next((k for k, v in WEBAPPS.items() if v[1] == app.group(1)), None)
+        out.setdefault(ego.group(1), []).append(
+            {"name": name, "icon": icon, "url": app.group(1),
+             "key": key, "exec": m.group(1), "desktop": f.name})
+    return out
+
+
+def remove_rule(pattern):
+    """Delete one [[rule]] block textually, so comments elsewhere survive.
+
+    tomllib is read-only and tomlkit is not installed, so rewriting the file
+    from parsed data would silently strip every comment in it.
+    """
+    if not RULES.exists():
+        return False
+    lines = RULES.read_text().splitlines(keepends=True)
+    starts = [i for i, l in enumerate(lines) if l.strip() == "[[rule]]"]
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(lines)
+        block = "".join(lines[start:end])
+        if pattern in block:
+            # keep any comment lines that sit above the header
+            head = start
+            while head > 0 and lines[head - 1].lstrip().startswith("#"):
+                head -= 1
+            # and the blank line that separated this block from the previous one
+            while head > 0 and lines[head - 1].strip() == "":
+                head -= 1
+            del lines[head:end]
+            RULES.write_text("".join(lines))
+            return True
+    return False
+
+
 def ego_options(by_class, first=()):
     """Picker rows: every ego, the ones on this desktop first.
 
@@ -720,7 +772,7 @@ Rules: ~/.config/omaego/rules.toml
 
 # Read-only queries the bar widget polls several times a minute. Logging them
 # would churn the routing history out of the log's size cap within the hour.
-QUIET = {"space", "here", "list", "default", "--help", "-h"}
+QUIET = {"space", "here", "list", "default", "panel", "--help", "-h"}
 
 
 def main(argv):
@@ -745,6 +797,14 @@ def main(argv):
 
     if cmd == "list":
         by_class = all_targets()
+        if want_json:
+            dflt = default_slug()
+            print(json.dumps([
+                {"slug": t["slug"], "name": t["name"], "class": t["wm_class"],
+                 "managed": t["managed"], "default": t["slug"] == dflt}
+                for t in sorted(by_class.values(),
+                                key=lambda t: (not t["managed"], t["name"]))]))
+            return 0
         for t in sorted(by_class.values(), key=lambda t: (not t["managed"], t["name"])):
             kind = "routable" if t["managed"] else "shared data dir"
             print(f"{t['name']:<24} class={t['wm_class']:<22} {kind}")
@@ -858,6 +918,13 @@ def main(argv):
         sub = argv[1] if len(argv) > 1 else "list"
         if sub == "list":
             rules = load_rules()
+            if want_json:
+                print(json.dumps([
+                    {"pattern": r.get("url") or r.get("match") or "",
+                     "profile": r.get("profile"), "app": bool(r.get("app")),
+                     "rewrite": bool(r.get("rewrite")), "source": r.get("source")}
+                    for r in rules]))
+                return 0
             if not rules:
                 print(f"no rules in {RULES}")
                 return 0
@@ -891,6 +958,35 @@ def main(argv):
                     f.write("app = true\n")
             print(f"added: {pat} -> {ego['name']}")
             return 0
+        if sub == "new":
+            # Interactive add, for the bar panel.
+            egos = profiles()
+            pat = prompt_text("URL pattern, e.g. https://acme.example.com/*")
+            if not pat:
+                return 0
+            ego = pick([(e["name"], e) for e in egos.values()],
+                       f"Open {pat} in…")
+            if ego is None:
+                return 0
+            for r in load_rules():
+                if (r.get("url") or r.get("match")) == pat:
+                    notify(f"a rule for {pat} already exists")
+                    return 1
+            with RULES.open("a") as f:
+                f.write(f'\n[[rule]]\nurl = "{pat}"\nprofile = "{ego["name"]}"\n')
+            notify(f"{pat} -> {ego['name']}")
+            return 0
+
+        if sub == "rm":
+            if len(argv) < 3:
+                print("usage: omaego rule rm <url-glob>", file=sys.stderr)
+                return 2
+            if remove_rule(argv[2]):
+                print(f"removed rule {argv[2]}")
+                return 0
+            print(f"no rule matching {argv[2]!r}", file=sys.stderr)
+            return 1
+
         print(f"unknown: omaego rule {sub}", file=sys.stderr)
         return 2
 
@@ -910,6 +1006,42 @@ def main(argv):
                   "(Teams, Outlook, Gmail, Meet) — a rule\nthere would send a "
                   "customer's link to the wrong identity.")
             return 0
+
+        if sub == "installed":
+            inst = installed_apps()
+            if want_json:
+                print(json.dumps(inst))
+            else:
+                for slug, apps in sorted(inst.items()):
+                    print(f"{slug}:")
+                    for a in apps:
+                        print(f"    {a['name']:<28} {a['url']}")
+            return 0
+
+        if sub == "catalog":
+            print(json.dumps([
+                {"key": k, "name": v[0], "url": v[1], "ruleDomain": v[2]}
+                for k, v in sorted(WEBAPPS.items())]))
+            return 0
+
+        if sub == "pick":
+            # Interactive install, for the bar panel: walker chooses the app so
+            # the panel needs no catalogue UI of its own.
+            if len(argv) < 3:
+                print("usage: omaego app pick <ego>", file=sys.stderr)
+                return 2
+            slug = argv[2]
+            if slug not in profiles():
+                print(f"unknown ego {slug!r}", file=sys.stderr)
+                return 1
+            have = {a["url"] for a in installed_apps().get(slug, [])}
+            opts = [(f"{v[0]}", k) for k, v in sorted(WEBAPPS.items())
+                    if v[1] not in have]
+            if not opts:
+                notify(f"every catalogue app is already installed for {slug}")
+                return 0
+            key = pick(opts, f"Add a web app to {profiles()[slug]['name']}…")
+            return 0 if key is None else app_add(slug, [key])
 
         if sub in ("add", "remove"):
             if len(argv) < 3:
@@ -958,6 +1090,27 @@ def main(argv):
         for a, cls, foc in rows:
             kind = "webapp" if a is None else "browser"
             print(f"{a or '-':<18} {kind:<8} {cls}{' (focused)' if foc else ''}")
+        return 0
+
+    if cmd == "panel":
+        # Everything the bar panel renders, in one call - four separate
+        # processes per open would be four Chrome-free but still pointless forks.
+        by_class = all_targets()
+        here = {c for _, c, _ in browsers_here()}
+        inst = installed_apps()
+        dflt = default_slug()
+        print(json.dumps({
+            "workspace": current_workspace(),
+            "fallback": (profiles().get(dflt or "") or {}).get("name"),
+            "egos": [{"slug": t["slug"], "name": t["name"], "class": t["wm_class"],
+                      "default": t["slug"] == dflt,
+                      "here": t["wm_class"] in here,
+                      "apps": inst.get(t["slug"], [])}
+                     for t in sorted(profiles().values(), key=lambda t: t["name"])],
+            "rules": [{"pattern": r.get("url") or r.get("match") or "",
+                       "profile": r.get("profile"), "app": bool(r.get("app"))}
+                      for r in load_rules()],
+        }))
         return 0
 
     if cmd == "space":

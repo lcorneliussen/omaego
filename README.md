@@ -132,10 +132,22 @@ a wrapper script.
 
 ## The bar widget
 
-Shows the ego owning the current workspace, dimmed when the workspace has none,
+The label shows the ego owning the current workspace, dimmed when there is none
 and in the urgent colour when a workspace has gone **mixed** (more than one ego),
-which is usually worth noticing. Click opens a browser here — the picker if the
-workspace is empty. It shells out to `omaego space --json`.
+which is usually worth noticing.
+
+Clicking opens a panel listing every ego — marking which are on this desktop —
+with their installed web apps underneath. From it you can launch an ego or one
+of its apps here, add an app (`+app`), add a rule, or delete one. Text entry
+goes through walker rather than QML dialogs, so the picker you already know
+handles it and the QML stays small.
+
+It gets everything from one `omaego panel` call, and never logs its polling.
+
+**If you build on this:** a third-party bar widget's QML file *must* be named
+`BarWidget.qml`. Any other name fails with Qt's "File name case mismatch",
+which points nowhere near the cause. First-party widgets use other names only
+because they live inside the shell's own module tree.
 
 ## Requires
 
