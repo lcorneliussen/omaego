@@ -923,6 +923,38 @@ def normalize_url(url):
     return url
 
 
+def agent_find_icon(slug, name, app_url):
+    """Hand the icon hunt to the default omarchy agent.
+
+    The agent cannot pass a URL back into this process, so it is given the
+    command that applies the result instead and runs it itself.
+    """
+    prompt = (
+        f"Find the official icon for the web app \"{name}\" at {app_url} and "
+        f"install it.\n\n"
+        f"Prefer the site's own apple-touch-icon or a vendor press/brand asset; "
+        f"a square PNG at 256px or larger, with transparency if available. "
+        f"Avoid favicon services, which cap at 64px and look soft on the bar.\n\n"
+        f"Then apply it with exactly:\n"
+        f"    omaego app icon {slug} \"{name}\" <image-url-or-path>\n\n"
+        f"That command downloads, normalises and rewrites the .desktop entry, so "
+        f"nothing else needs editing. Verify afterwards with:\n"
+        f"    omaego app installed | grep -i \"{name}\"")
+    # omarchy only prints a hint when no default agent is configured, and a
+    # Popen succeeds either way - so check before claiming the handoff worked.
+    if not (Path.home() / ".config/omarchy/defaults/agent").exists():
+        notify("no default agent set — run: omarchy default agent <name>")
+        print("no default agent configured; run: omarchy default agent <name>",
+              file=sys.stderr)
+        return False
+    try:
+        subprocess.Popen(["omarchy", "agent", "prompt", prompt],
+                         start_new_session=True)
+        return True
+    except Exception:
+        return False
+
+
 def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
             interactive=False):
     # Resolve the ego FIRST: naming a web app needs it, both to exclude the
@@ -993,8 +1025,20 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
             host = urlsplit(app_url).hostname
             # Only ask where someone is there to answer. A scripted `app add`
             # would otherwise sit on this prompt until walker times out.
-            given = prompt_text(f"No icon found at {host} — paste an image URL, "
-                                f"or Enter to use a generic one") if interactive else None
+            given = None
+            if interactive:
+                choice = pick([("Paste an image URL…", "url"),
+                               ("Let the agent find one", "agent"),
+                               ("Use a generic icon", "generic")],
+                              f"No icon found at {host}")
+                if choice == "url":
+                    given = prompt_text(f"Image URL for {name}")
+                elif choice == "agent":
+                    r = run_install("google-chrome")
+                    if r.returncode == 0 and agent_find_icon(slug, name, app_url):
+                        print(f"  {name}: installed; the agent is finding an icon")
+                        notify(f"added {name} — the agent is finding an icon")
+                    continue
             if given:
                 dest = ICON_DIR / f"{icon_slug}.png"
                 if fetch_icon(given.strip(), dest) and normalize_icon(dest):
@@ -1064,7 +1108,7 @@ opens on the workspace you are on - never by switching desktops.
   omaego app add <ego> --url <url> | --name <name>
                          either one is enough; you are asked for the other
   omaego app remove <ego> <app>...
-  omaego app icon <ego> "<app name>" <image url|path>
+  omaego app icon <ego> "<app name>" <image url|path|--agent>
   omaego launch <slug> [url]
   omaego default [slug]  show/set the FALLBACK ego: the one that owns plain
                          "Google Chrome" and web apps. Not an "active" ego -
@@ -1330,7 +1374,7 @@ def main(argv):
             print("\n  omaego app add <ego> <app>...            install them\n  omaego app add <ego> <app> --rule        also route that host to the ego")
             print("  omaego app add <ego> --url <url> --name <name>")
             print("  omaego app remove <ego> <app>...")
-            print('  omaego app icon <ego> "<app name>" <image url|path>')
+            print('  omaego app icon <ego> "<app name>" <image url|path|--agent>')
             print("\n[rule] marks a host one ego can plausibly own outright; "
                   "--rule writes it.\nHosts without it are shared between egos "
                   "(Teams, Outlook, Gmail, Meet) — a rule\nthere would send a "
@@ -1352,10 +1396,19 @@ def main(argv):
                 print(f"no app {want!r} in {slug}; see: omaego app installed",
                       file=sys.stderr)
                 return 1
+            if src == "--agent" or (not src and not sys.stdin.isatty()):
+                if agent_find_icon(slug, app["name"], app["url"]):
+                    print(f"  handed {app['name']} to the default agent")
+                    return 0
+                print("could not launch the agent", file=sys.stderr)
+                return 1
             if not src:
-                src = prompt_text(f"Image URL for {app['name']}")
+                src = prompt_text(f"Image URL for {app['name']} "
+                                  f"(or type agent to let the agent find one)")
                 if not src:
                     return 0
+                if src.strip().lower() == "agent":
+                    return 0 if agent_find_icon(slug, app["name"], app["url"]) else 1
             icon_slug = re.sub(r"[^a-z0-9]+", "-", app["name"].lower()).strip("-")
             ICON_DIR.mkdir(parents=True, exist_ok=True)
             dest = ICON_DIR / f"{icon_slug}.png"
