@@ -87,6 +87,9 @@ Panel {
     // Two-faced mark: half light, half dark, drawn rather than taken from a
     // glyph because no Nerd Font carries one. The ring keeps the dark half
     // readable on a dark bar, where a literal black fill would disappear.
+    // Jekyll and Hyde: one person, split straight down the middle. No circle.
+    // The dark half is a dimmed foreground rather than literal black - black has
+    // no edge against a dark bar and the half simply disappears.
     Item {
       id: mark
       width: root.iconPx
@@ -94,25 +97,6 @@ Panel {
       anchors.verticalCenter: parent.verticalCenter
       opacity: root.hereEgos.length ? 1.0 : 0.55
 
-      Rectangle {
-        anchors.fill: parent
-        radius: width / 2
-        color: "#000000"
-      }
-      Item {
-        width: parent.width / 2
-        height: parent.height
-        clip: true
-        Rectangle {
-          width: mark.width
-          height: mark.height
-          radius: mark.width / 2
-          color: "#ffffff"
-        }
-      }
-      // The face, knocked out in the opposite colour on each half. Splitting a
-      // glyph's own colours instead does not work: the dark half loses its edge
-      // against a dark bar and reads as a rendering fault.
       Item {
         width: parent.width / 2
         height: parent.height
@@ -121,9 +105,9 @@ Panel {
           width: mark.width
           height: mark.height
           text: root.faceGlyph
-          color: "#000000"
+          color: root.fg
           font.family: root.iconFont
-          font.pixelSize: Math.round(root.iconPx * 0.62)
+          font.pixelSize: root.iconPx
           horizontalAlignment: Text.AlignHCenter
           verticalAlignment: Text.AlignVCenter
         }
@@ -138,19 +122,12 @@ Panel {
           width: mark.width
           height: mark.height
           text: root.faceGlyph
-          color: "#ffffff"
+          color: Qt.darker(root.fg, 2.6)
           font.family: root.iconFont
-          font.pixelSize: Math.round(root.iconPx * 0.62)
+          font.pixelSize: root.iconPx
           horizontalAlignment: Text.AlignHCenter
           verticalAlignment: Text.AlignVCenter
         }
-      }
-      Rectangle {
-        anchors.fill: parent
-        radius: width / 2
-        color: "transparent"
-        border.width: root.ringPx
-        border.color: "#ffffff"
       }
     }
 
