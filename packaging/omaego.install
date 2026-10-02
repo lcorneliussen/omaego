@@ -1,0 +1,19 @@
+post_install() {
+  cat <<'MSG'
+omaego is installed. Finish the per-user wiring with:
+
+    omaego setup
+
+Then create your first ego:
+
+    omaego add "Work"
+    omaego app add work teams outlook
+
+The bar widget is a separate plugin:
+    omarchy plugin add https://github.com/lcorneliussen/omaego-bar.git --enable
+MSG
+}
+
+post_upgrade() {
+  echo "omaego upgraded. Run 'omaego sync' if desktop entries or egos changed."
+}

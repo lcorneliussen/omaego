@@ -1,0 +1,28 @@
+# Maintainer: Lars Corneliussen <lcorneliussen@users.noreply.github.com>
+pkgname=omaego
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Keep work, private and customer contexts apart in one browser: per-ego Chrome profiles with workspace-aware link routing"
+arch=('any')
+url="https://github.com/lcorneliussen/omaego"
+license=('MIT')
+depends=('python' 'hyprland' 'xdg-utils')
+optdepends=(
+  'google-chrome: the browser egos run in (chromium works, but Arch builds have no Google sync)'
+  'walker: the ego picker and prompts'
+  'imagemagick: normalises web app icons'
+  'curl: resolves shortened links before routing'
+)
+install=omaego.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('99c95c08c4994ae7083e70588e1bbb65aadeb2147c84d090905af3f610f4042c')
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+  install -Dm755 bin/omaego        "$pkgdir/usr/bin/omaego"
+  install -Dm755 bin/omaego-webapp "$pkgdir/usr/bin/omaego-webapp"
+  install -Dm644 examples/rules.toml "$pkgdir/usr/share/omaego/rules.toml"
+  install -Dm644 README.md         "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/gotchas.md   "$pkgdir/usr/share/doc/$pkgname/gotchas.md"
+  install -Dm644 LICENSE           "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
