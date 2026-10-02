@@ -144,6 +144,10 @@ handles it and the QML stays small.
 
 It gets everything from one `omaego panel` call, and never logs its polling.
 
+**After enabling or moving the widget, run `omarchy restart shell`** — a hot
+reload will not re-instantiate it in a new bar section, and it simply will not
+appear, with nothing in the logs to say so.
+
 **If you build on this:** a third-party bar widget's QML file *must* be named
 `BarWidget.qml`. Any other name fails with Qt's "File name case mismatch",
 which points nowhere near the cause. First-party widgets use other names only
