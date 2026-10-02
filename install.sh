@@ -33,10 +33,13 @@ mkdir -p "$BIN" "$APPS" "$CFG"
 echo "binaries:"
 link "$REPO/bin/omaego"        "$BIN/omaego"
 link "$REPO/bin/omaego-webapp" "$BIN/omaego-webapp"
-# Compatibility: launchers and .desktop files written against the older names
-# keep working. omaego-webapp still accepts --profile= as well as --ego=.
-link "$BIN/omaego"             "$BIN/urlrouter"
-link "$BIN/omaego-webapp"      "$BIN/chrome-webapp"
+# Compatibility shims for installs that predate the rename, off by default so a
+# fresh install leaves nothing duplicated. omaego-webapp accepts --profile= as
+# well as --ego= either way, so existing launchers keep working once repointed.
+if [ "${OMAEGO_COMPAT:-0}" = "1" ]; then
+  link "$BIN/omaego"           "$BIN/urlrouter"
+  link "$BIN/omaego-webapp"    "$BIN/chrome-webapp"
+fi
 
 echo "config:"
 if [ ! -f "$CFG/rules.toml" ]; then
