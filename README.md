@@ -100,11 +100,18 @@ see `docs/gotchas.md`, which is the part worth reading before changing anything.
 ## Install
 
 ```bash
-git clone <this repo> ~/Work/omaego
-cd ~/Work/omaego
-./install.sh --with-plugin
-omarchy plugin enable io.github.lcorneliussen.omaego right    # optional bar widget
+# packaged, pinned to a released tarball
+git clone https://github.com/lcorneliussen/omaego
+cd omaego/packaging && makepkg -si
+omaego setup
+
+# the bar widget lives in its own repository
+omarchy plugin add https://github.com/lcorneliussen/omaego-bar.git --enable
+omarchy restart shell
 ```
+
+To run from a checkout instead, `./install.sh` symlinks `bin/` into
+`~/.local/bin` and does the same wiring.
 
 Idempotent, and backs up anything it replaces. It links `bin/` into
 `~/.local/bin`, migrates `~/.config/urlrouter/rules.toml` if present, installs
