@@ -11,7 +11,7 @@ desktop to do it.
 ```
 omaego list                     # the egos you have
 omaego space                    # which ego owns this workspace
-omaego add "Acme"               # a new ego
+omaego add "Acme"               # a new ego (or: omaego new, or the bar panel)
 omaego <url>                    # what the desktop entry calls
 ```
 
@@ -137,11 +137,14 @@ The label shows the ego owning the current workspace, dimmed when there is none
 and in the urgent colour when a workspace has gone **mixed** (more than one ego),
 which is usually worth noticing.
 
-Clicking opens a panel listing every ego — marking which are on this desktop —
-with their installed web apps underneath. From it you can launch an ego or one
-of its apps here, add an app (`+app`), add a rule, or delete one. Text entry
-goes through walker rather than QML dialogs, so the picker you already know
-handles it and the QML stays small.
+Clicking opens a panel with **one column per ego**. Egos on this desktop are
+tinted. Each column shows the ego (click to open its browser here; hovering
+outlines its windows), its web apps (click to launch), the hosts that always
+open in it, and `+ Add app` / `+ Add rule`. Hover a rule to reveal its ✕. The last
+column, **New ego**, runs `omaego new`: name it in walker, and its window
+opens so you can sign in. Rules that name no ego, such as the Zoom rewrites, are
+listed underneath. Text entry goes through walker rather than QML dialogs, so
+the picker you already know handles it and the QML stays small.
 
 It gets everything from one `omaego panel` call, and never logs its polling.
 

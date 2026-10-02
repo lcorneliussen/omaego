@@ -175,120 +175,286 @@ Panel {
     onClicked: root.toggle()
   }
 
+  // One column per ego, side by side: its browser, its web apps, the hosts
+  // that always open in it. The last column makes a new ego. Rules that name
+  // no ego (Zoom rewrites and the like) sit underneath, across the panel.
+  //
+  // Hover is one root property rather than per-row containsMouse, the same
+  // contract the first-party panels keep: exactly one highlight on screen.
+  property string hoverKey: ""
+  readonly property real colWidth: Style.space(220)
+  readonly property real colGap: Style.space(10)
+  readonly property var looseRules: model.looseRules || []
+
+  function act(args) { run(args); close(); later() }
+  function bare(pattern) { return String(pattern).replace(/^https?:\/\//, "") }
+
+  // A hoverable, clickable row. `key` must be unique across the panel.
+  component Hit: CursorSurface {
+    id: hit
+    property string key: ""
+    signal activated()
+    signal entered()
+    signal exited()
+    foreground: root.fg
+    hasCursor: root.hoverKey === key
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: { root.hoverKey = hit.key; hit.entered() }
+      onExited: { if (root.hoverKey === hit.key) root.hoverKey = ""; hit.exited() }
+      onClicked: hit.activated()
+    }
+  }
+
+  component Caption: Text {
+    textFormat: Text.PlainText
+    color: root.dim
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.caption
+    elide: Text.ElideRight
+  }
+
+  // "+ Add app" and friends: quiet until hovered.
+  component AddRow: Hit {
+    id: add
+    property string label: ""
+    width: parent ? parent.width : 0
+    implicitHeight: addText.implicitHeight + Style.space(8)
+    Caption {
+      id: addText
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(6)
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      text: "+  " + add.label
+      color: add.hasCursor ? root.fg : root.dim
+    }
+  }
+
+  component RuleRow: Hit {
+    id: rr
+    property var rule
+    width: parent ? parent.width : 0
+    implicitHeight: Math.max(ruleText.implicitHeight, rmBtn.height) + Style.space(4)
+    Caption {
+      id: ruleText
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(6)
+      anchors.right: rmBtn.left
+      anchors.rightMargin: Style.space(4)
+      anchors.verticalCenter: parent.verticalCenter
+      text: root.bare(rr.rule.pattern) + (rr.rule.app ? "  · app" : "")
+      color: rr.hasCursor ? root.fg : root.dim
+      elide: Text.ElideMiddle
+    }
+    // Shown on hover only, and only the ✕ deletes: a stray click on the
+    // row must not lose a rule.
+    Caption {
+      id: rmBtn
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(6)
+      anchors.verticalCenter: parent.verticalCenter
+      text: "✕"
+      opacity: rr.hasCursor ? 1 : 0
+      color: root.bar ? root.bar.urgent : root.fg
+      MouseArea {
+        anchors.fill: parent
+        anchors.margins: -Style.space(4)
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.act([root.omaego, "rule", "rm", rr.rule.pattern])
+      }
+    }
+  }
+
   KeyboardPanel {
+    id: card
     anchorItem: button
     owner: root
     bar: root.bar
     open: root.opened
-    contentWidth: Style.space(420)
-    contentHeight: Math.min(column.implicitHeight + Style.space(24), Style.space(620))
+    contentWidth: fittedContentWidth(body.implicitWidth + padding * 2)
+    contentHeight: fittedContentHeight(body.implicitHeight)
 
     Column {
-      id: column
-      width: parent.width
-      spacing: Style.space(6)
+      id: body
+      spacing: Style.space(10)
 
-      PanelSectionHeader { text: "Egos"; foreground: root.fg; fontFamily: root.fontFamily }
+      // RowLayout so every column stretches to the tallest one.
+      RowLayout {
+        id: columns
+        spacing: root.colGap
 
-      Repeater {
-        model: root.egos
-        Column {
-          width: column.width
-          spacing: Style.space(2)
+        Repeater {
+          model: root.egos
 
-          Row {
-            width: parent.width
-            spacing: Style.space(8)
-            Text {
-              text: modelData.name + (modelData.default ? "  (fallback)" : "")
-              color: root.fg; font.family: root.fontFamily
-              font.bold: modelData.here
-              width: parent.width - Style.space(150)
-              elide: Text.ElideRight
-              MouseArea {
-                anchors.fill: parent
-                // Opens this ego's browser on the workspace you are on.
-                onClicked: { root.run([root.omaego, "launch", modelData.slug]); root.close() }
-              }
-            }
-            Text {
-              text: modelData.here ? "on this desktop" : "elsewhere"
-              color: root.dim; font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-            Text {
-              text: "  +app"
-              color: root.dim; font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              MouseArea {
-                anchors.fill: parent
-                onClicked: { root.run([root.omaego, "app", "pick", modelData.slug])
-                             root.close(); root.later() }
-              }
-            }
-          }
+          BorderSurface {
+            id: egoCard
+            readonly property var ego: modelData
+            Layout.preferredWidth: root.colWidth
+            Layout.fillHeight: true
+            implicitHeight: egoCol.implicitHeight + Style.space(16)
+            radius: Style.cornerRadius
+            // Egos on this desktop get the selected tint: the "selected" border
+            // token alone draws nothing in most themes.
+            color: ego.here ? Style.selectedFillFor(root.fg, Color.accent) : "transparent"
+            borderSpec: Border.controlSpec("normal", root.fg, Color.accent)
 
-          Flow {
-            width: parent.width
-            spacing: Style.space(6)
-            leftPadding: Style.space(12)
-            Repeater {
-              model: modelData.apps
-              Text {
-                text: "· " + modelData.name
-                color: root.dim; font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                MouseArea {
-                  anchors.fill: parent
-                  // The stored Exec already names the ego, so launching it here
-                  // cannot land the app in the wrong identity.
-                  onClicked: { root.run(["sh", "-c", modelData.exec]); root.close() }
+            Column {
+              id: egoCol
+              x: Style.space(8); y: Style.space(8)
+              width: parent.width - Style.space(16)
+              spacing: Style.space(2)
+
+              // The ego itself: click opens its browser on this desktop.
+              Hit {
+                key: "ego:" + egoCard.ego.slug
+                width: parent.width
+                implicitHeight: head.implicitHeight + Style.space(10)
+                onActivated: root.act([root.omaego, "launch", egoCard.ego.slug])
+                onEntered: if (egoCard.ego.here) root.run([root.omaego, "highlight", egoCard.ego.slug])
+                onExited: if (egoCard.ego.here) root.run([root.omaego, "highlight", "off"])
+
+                Column {
+                  id: head
+                  x: Style.space(6)
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width - Style.space(12)
+                  spacing: Style.space(1)
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: egoCard.ego.name
+                    color: root.fg
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.title
+                    font.bold: true
+                    elide: Text.ElideRight
+                  }
+                  Row {
+                    spacing: Style.space(5)
+                    Rectangle {
+                      width: Style.space(6); height: width; radius: width / 2
+                      anchors.verticalCenter: parent.verticalCenter
+                      color: egoCard.ego.here ? Color.accent : "transparent"
+                      border.width: egoCard.ego.here ? 0 : 1
+                      border.color: root.dim
+                    }
+                    Caption {
+                      text: (egoCard.ego.here ? "on this desktop" : "open here")
+                            + (egoCard.ego.default ? "  ·  fallback" : "")
+                    }
+                  }
                 }
               }
+
+              Item { width: 1; height: Style.space(4) }
+              PanelSectionHeader {
+                x: Style.space(6)
+                text: "APPS"; foreground: root.fg; fontFamily: root.fontFamily
+              }
+
+              Repeater {
+                model: egoCard.ego.apps
+                Hit {
+                  key: "app:" + egoCard.ego.slug + ":" + modelData.desktop
+                  width: egoCol.width
+                  implicitHeight: Math.max(appIcon.height, appName.implicitHeight) + Style.space(8)
+                  // The stored Exec already names the ego, so launching it
+                  // here cannot land the app in the wrong identity.
+                  onActivated: root.act(["sh", "-c", modelData.exec])
+                  Image {
+                    id: appIcon
+                    x: Style.space(6)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.font.iconLarge; height: width
+                    sourceSize.width: width * 2; sourceSize.height: height * 2
+                    source: modelData.iconPath ? "file://" + modelData.iconPath : ""
+                    fillMode: Image.PreserveAspectFit
+                    smooth: true
+                  }
+                  Text {
+                    id: appName
+                    anchors.left: appIcon.right
+                    anchors.leftMargin: Style.space(8)
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(6)
+                    anchors.verticalCenter: parent.verticalCenter
+                    textFormat: Text.PlainText
+                    text: modelData.short || modelData.name
+                    color: root.fg
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    elide: Text.ElideRight
+                  }
+                }
+              }
+              AddRow {
+                key: "addapp:" + egoCard.ego.slug
+                label: "Add app"
+                onActivated: root.act([root.omaego, "app", "pick", egoCard.ego.slug])
+              }
+
+              Item { width: 1; height: Style.space(4) }
+              PanelSectionHeader {
+                x: Style.space(6)
+                text: "ALWAYS OPENS HERE"; foreground: root.fg; fontFamily: root.fontFamily
+              }
+              Repeater {
+                model: egoCard.ego.rules
+                RuleRow { key: "rule:" + modelData.pattern; rule: modelData }
+              }
+              AddRow {
+                key: "addrule:" + egoCard.ego.slug
+                label: "Add rule"
+                onActivated: root.act([root.omaego, "rule", "new", egoCard.ego.slug])
+              }
+            }
+          }
+        }
+
+        // New ego: a hollow column, so it reads as a slot rather than an ego.
+        Hit {
+          id: newCard
+          key: "newego"
+          Layout.preferredWidth: root.colWidth * 0.6
+          Layout.fillHeight: true
+          implicitHeight: newCol.implicitHeight + Style.space(16)
+          bordered: true
+          onActivated: root.act([root.omaego, "new"])
+          Column {
+            id: newCol
+            anchors.centerIn: parent
+            spacing: Style.space(4)
+            Text {
+              anchors.horizontalCenter: parent.horizontalCenter
+              text: "+"
+              color: newCard.hasCursor ? root.fg : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display
+            }
+            Caption {
+              anchors.horizontalCenter: parent.horizontalCenter
+              text: "New ego"
+              color: newCard.hasCursor ? root.fg : root.dim
             }
           }
         }
       }
 
-      PanelSeparator {}
-      PanelSectionHeader { text: "Rules"; foreground: root.fg; fontFamily: root.fontFamily }
-
-      Repeater {
-        model: root.rules
-        Row {
-          width: column.width
-          spacing: Style.space(8)
-          Text {
-            text: modelData.pattern
-            color: root.fg; font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            width: parent.width - Style.space(130)
-            elide: Text.ElideMiddle
-          }
-          Text {
-            text: (modelData.profile || "this desktop") + (modelData.app ? " · app" : "")
-            color: root.dim; font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-          Text {
-            text: " ✕"
-            color: root.dim; font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            MouseArea {
-              anchors.fill: parent
-              onClicked: { root.run([root.omaego, "rule", "rm", modelData.pattern]); root.later() }
-            }
-          }
+      Column {
+        visible: root.looseRules.length > 0
+        width: columns.width
+        spacing: Style.space(2)
+        PanelSeparator { width: parent.width }
+        PanelSectionHeader {
+          x: Style.space(6)
+          text: "ANY EGO · REWRITES"; foreground: root.fg; fontFamily: root.fontFamily
         }
-      }
-
-      Text {
-        text: "+ add rule"
-        color: root.dim; font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        MouseArea {
-          anchors.fill: parent
-          onClicked: { root.run([root.omaego, "rule", "new"]); root.close(); root.later() }
+        Repeater {
+          model: root.looseRules
+          RuleRow { key: "rule:" + modelData.pattern; rule: modelData; width: Math.min(columns.width, Style.space(420)) }
         }
       }
     }

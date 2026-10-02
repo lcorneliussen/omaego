@@ -425,6 +425,22 @@ def installed_apps():
     return out
 
 
+def icon_path(name):
+    """Resolve an Icon= name to a file, for the panel's QML Image."""
+    if not name:
+        return ""
+    if name.startswith("/"):
+        return name if Path(name).exists() else ""
+    base = Path.home() / ".local/share/icons/hicolor"
+    for size in ("256x256", "128x128", "96x96", "64x64", "48x48", "scalable"):
+        for ext in ("png", "svg"):
+            f = base / size / "apps" / f"{name}.{ext}"
+            if f.exists():
+                return str(f)
+    f = Path.home() / ".local/share/applications/icons" / f"{name}.png"
+    return str(f) if f.exists() else ""
+
+
 def remove_rule(pattern):
     """Delete one [[rule]] block textually, so comments elsewhere survive.
 
@@ -767,6 +783,7 @@ opens on the workspace you are on - never by switching desktops.
   omaego list            show egos, and which Chrome-internal profiles are not
                          routable on their own
   omaego add <name>      create an empty ego
+  omaego new             same, asking the name in walker, then open it to sign in
   omaego import <src> [name]
                          lift a Chrome-internal profile into its own ego
                          (needs Chrome fully quit)
@@ -881,6 +898,19 @@ def main(argv):
         print("     for hosts that must always open as this ego, wherever you are")
         return 0
 
+    if cmd == "new":
+        # Interactive add, for the bar panel: name it in walker, then open it so
+        # the first thing you do is sign in - an ego is only useful once synced.
+        name = prompt_text("Name for the new ego")
+        if not name:
+            return 0
+        existed = slugify(name) in profiles()
+        slug = add_profile(name)
+        launch(profiles()[slug], new_window=True)
+        notify(f"{name}: already existed, opened it" if existed
+               else f"created {name} - sign in to its Google/Microsoft account")
+        return 0
+
     if cmd == "launch":
         if len(argv) < 2:
             return 2
@@ -979,13 +1009,17 @@ def main(argv):
             print(f"added: {pat} -> {ego['name']}")
             return 0
         if sub == "new":
-            # Interactive add, for the bar panel.
+            # Interactive add, for the bar panel. An ego slug skips the picker -
+            # the panel asks from inside that ego's column.
             egos = profiles()
-            pat = prompt_text("URL pattern, e.g. https://acme.example.com/*")
+            ego = egos.get(argv[2]) if len(argv) > 2 else None
+            hint = f" for {ego['name']}" if ego else ""
+            pat = prompt_text(f"URL pattern{hint}, e.g. https://acme.example.com/*")
             if not pat:
                 return 0
-            ego = pick([(e["name"], e) for e in egos.values()],
-                       f"Open {pat} in…")
+            if ego is None:
+                ego = pick([(e["name"], e) for e in egos.values()],
+                           f"Open {pat} in…")
             if ego is None:
                 return 0
             for r in load_rules():
@@ -1123,17 +1157,36 @@ def main(argv):
         here = {c for _, c, _ in browsers_here()}
         inst = installed_apps()
         dflt = default_slug()
+        rules = [{"pattern": r.get("url") or r.get("match") or "",
+                  "profile": r.get("profile"), "app": bool(r.get("app"))}
+                 for r in load_rules()]
+        egos = sorted(profiles().values(), key=lambda t: t["name"])
+        names = {t["name"].lower() for t in egos} | {t["slug"] for t in egos}
+
+        def panel_app(a, ego_name):
+            # "Outlook Work" is the launcher's name; inside the Work column the
+            # ego is already said, so show "Outlook".
+            short = re.sub(rf"\s*\b{re.escape(ego_name)}\b\s*", " ",
+                           a["name"], flags=re.I).strip() or a["name"]
+            return {**a, "short": short, "iconPath": icon_path(a["icon"])}
+
+        def owns(t, r):
+            p = (r["profile"] or "").lower()
+            return p in (t["name"].lower(), t["slug"])
+
         print(json.dumps({
             "workspace": current_workspace(),
             "fallback": (profiles().get(dflt or "") or {}).get("name"),
             "egos": [{"slug": t["slug"], "name": t["name"], "class": t["wm_class"],
                       "default": t["slug"] == dflt,
                       "here": t["wm_class"] in here,
-                      "apps": inst.get(t["slug"], [])}
-                     for t in sorted(profiles().values(), key=lambda t: t["name"])],
-            "rules": [{"pattern": r.get("url") or r.get("match") or "",
-                       "profile": r.get("profile"), "app": bool(r.get("app"))}
-                      for r in load_rules()],
+                      "apps": [panel_app(a, t["name"]) for a in inst.get(t["slug"], [])],
+                      "rules": [r for r in rules if owns(t, r)]}
+                     for t in egos],
+            # Rules with no ego (rewrite/app-only) or naming one that is gone.
+            "looseRules": [r for r in rules
+                           if (r["profile"] or "").lower() not in names],
+            "rules": rules,
         }))
         return 0
 
