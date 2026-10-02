@@ -18,7 +18,7 @@ import sys
 import time
 import tomllib
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 LOG = Path.home() / ".cache/omaego.log"
 ROUTES = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omaego/routes.jsonl"
@@ -381,6 +381,72 @@ def load_rules():
         return []
 
 
+# Hosts that carry the real destination in a query parameter. Purely local.
+WRAPPERS = {
+    "safelinks.protection.outlook.com": "url",   # Teams / Outlook ATP
+    "eur01.safelinks.protection.outlook.com": "url",
+    "l.facebook.com": "u",
+    "l.messenger.com": "u",
+    "out.reddit.com": "url",
+    "www.google.com": "q",                        # /url?q=
+    "href.li": None,                              # path is the URL
+    "linkprotect.cudasvc.com": "a",
+    "urldefense.com": None,                       # proofpoint, path-encoded
+}
+
+# Resolved over the network, so gated to hosts that are nothing but redirects.
+SHORTENERS = {"t.co", "bit.ly", "lnkd.in", "tinyurl.com", "goo.gl", "ow.ly",
+              "buff.ly", "trib.al", "rb.gy", "is.gd", "cutt.ly", "shorturl.at",
+              "dub.sh", "t.ly", "s.id"}
+
+
+def unwrap(url, follow=True, depth=4):
+    """Resolve wrapper and shortener links to the destination.
+
+    Used to decide WHICH EGO a link belongs to: a Teams safelink or a t.co stub
+    says nothing about the customer it points at, so rules could never match it
+    and `learn` would only ever see the wrapper's host.
+
+    The original URL is what actually gets opened - unwrapping a safelink would
+    bypass the organisation's click-time scanning, which is not ours to skip.
+    """
+    seen = set()
+    for _ in range(depth):
+        if not url or url in seen:
+            break
+        seen.add(url)
+        u = urlsplit(url)
+        host = (u.hostname or "").lower()
+        key = next((k for k in WRAPPERS if host == k or host.endswith("." + k)), None)
+        if key:
+            param = WRAPPERS[key]
+            if param:
+                vals = parse_qs(u.query).get(param)
+                if vals:
+                    url = unquote(vals[0])
+                    continue
+            m = re.search(r"(https?%3A%2F%2F|https?://)", u.path or "", re.I)
+            if m:
+                url = unquote(u.path[m.start():].lstrip("/"))
+                continue
+            break
+        if follow and host in SHORTENERS:
+            try:
+                r = subprocess.run(
+                    ["curl", "-sIL", "--max-time", "2", "-o", "/dev/null",
+                     "-w", "%{url_effective}", url],
+                    capture_output=True, text=True, timeout=4)
+                final = r.stdout.strip()
+                if final and final != url:
+                    url = final
+                    continue
+            except Exception:
+                pass
+            break
+        break
+    return url
+
+
 def glob_to_re(pattern):
     """URL glob -> regex. '*' spans any characters; everything else is literal."""
     return "^" + "".join(".*" if part == "*" else re.escape(part)
@@ -621,7 +687,10 @@ def open_url(url=None, incognito=False):
 
     # 1. An explicit rule wins, but still opens on this desktop.
     source_class = next((cls for _, cls, foc in here if foc), None)
-    rule = match_rule(url, source_class) if url else None
+    routing_url = unwrap(url) if url else None
+    if routing_url and routing_url != url:
+        log(f"unwrapped: {url} -> {routing_url}")
+    rule = match_rule(routing_url, source_class) if url else None
     as_app = bool(rule and rule.get("app"))
     if rule and rule.get("rewrite"):
         pat, repl = rule["rewrite"]
@@ -669,7 +738,7 @@ def open_url(url=None, incognito=False):
 
     # Focus the profile's window on this desktop so the tab lands here, not on
     # whatever desktop that profile last had focus on.
-    log_route(url, target["name"], why or "fallback")
+    log_route(routing_url or url, target["name"], why or "fallback")
 
     addr = next((a for a, cls, _ in here if cls == target["wm_class"] and a), None)
     if as_app:

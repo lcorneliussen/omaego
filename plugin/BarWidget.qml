@@ -285,6 +285,14 @@ Panel {
     open: root.opened
     contentWidth: fittedContentWidth(body.implicitWidth + padding * 2)
     contentHeight: fittedContentHeight(body.implicitHeight)
+    focusTarget: keyCatcher
+
+    // Esc closes, like every other omarchy panel.
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      onCloseRequested: root.close()
+    }
 
     Column {
       id: body
@@ -307,7 +315,10 @@ Panel {
             radius: Style.cornerRadius
             // Egos on this desktop get the selected tint: the "selected" border
             // token alone draws nothing in most themes.
-            color: ego.here ? Style.selectedFillFor(root.fg, Color.accent) : "transparent"
+            // Presence is shown by fading the whole card, not by a fill behind
+            // it: a background competes with the per-ego colours on the card.
+            color: "transparent"
+            opacity: ego.here ? 1.0 : 0.45
             borderSpec: Border.controlSpec("normal", root.fg, Color.accent)
 
             Column {
