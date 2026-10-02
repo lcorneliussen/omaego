@@ -67,14 +67,16 @@ xdg-mime default omaego.desktop x-scheme-handler/http x-scheme-handler/https tex
 say "now     $(xdg-settings get default-web-browser)"
 
 if [ "${1:-}" = "--with-plugin" ]; then
-  echo "omarchy shell plugin:"
-  id=$(python3 -c "import json;print(json.load(open('$REPO/plugin/manifest.json'))['id'])")
-  mkdir -p "$PLUGINS"
-  # The shell refuses symlinks inside a plugin folder, so this one is copied.
-  rm -rf "${PLUGINS:?}/$id"
-  cp -r "$REPO/plugin" "$PLUGINS/$id"
-  say "installed $PLUGINS/$id"
-  say "enable with: omarchy plugin enable $id right"
+  echo "bar widget:"
+  # The widget is its own repository, installed the way omarchy installs any
+  # plugin rather than by copying files around.
+  if omarchy plugin add https://github.com/lcorneliussen/omaego-bar.git --enable --yes; then
+    say "installed and enabled io.github.lcorneliussen.omaego"
+    say "run 'omarchy restart shell' - a hot reload will not place a new widget"
+  else
+    say "could not add the widget; install it later with:"
+    say "  omarchy plugin add https://github.com/lcorneliussen/omaego-bar.git --enable"
+  fi
 fi
 
 echo

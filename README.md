@@ -99,13 +99,26 @@ see `docs/gotchas.md`, which is the part worth reading before changing anything.
 
 ## Install
 
-```bash
-# packaged, pinned to a released tarball
-git clone https://github.com/lcorneliussen/omaego
-cd omaego/packaging && makepkg -si
-omaego setup
+Everything, in one chain pinned to a reviewed commit:
 
-# the bar widget lives in its own repository
+```bash
+git clone https://github.com/lcorneliussen/omaego && \\
+  cd omaego && \\
+  git checkout b8a3a3e04894be8ed88289d333d751b3485ac70f && \\
+  ./install.sh --with-plugin && \\
+  omaego setup && \\
+  omarchy restart shell
+```
+
+Or packaged, which pins the released tarball by checksum:
+
+```bash
+cd omaego/packaging && makepkg -si && omaego setup
+```
+
+The widget alone, if you already have the CLI:
+
+```bash
 omarchy plugin add https://github.com/lcorneliussen/omaego-bar.git --enable
 omarchy restart shell
 ```
