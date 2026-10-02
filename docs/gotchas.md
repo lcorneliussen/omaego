@@ -36,6 +36,8 @@ Chrome 154 / omarchy 4.0.4, where the two omarchy bugs below **still stand**.
 
 | Thing | Reality |
 |---|---|
+| `set_prop` prop names | snake_case in the Lua API: `rounding`, `border_size`, `active_border_color`, `inactive_border_color`. The classic `bordercolor`/`bordersize` spellings are rejected as "Invalid prop name", and `hyprctl setprop` is gone entirely ("unknown request"). Setting `border_size` also **reflows the tiling and resizes windows** — for an outline, change colour only. |
+| Many dispatches | One `hyprctl dispatch` per window per property is a process each, and it lags visibly. `hyprctl --batch "dispatch … ; dispatch …"` accepts the Lua form and runs the lot in ~6ms. |
 | Lua dispatch | `hyprctl dispatch closewindow address:0x…` **errors**. Use `hl.dsp.window.close({ window = 'address:0x…' })` and `hl.dsp.focus({ window = 'address:0x…' })`. |
 | `hyprctl clients` | Has **no `focused` key** — it is `focusHistoryID`. Compare against `hyprctl activewindow`'s address instead, or the branch never fires. |
 

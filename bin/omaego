@@ -472,22 +472,45 @@ HILITE = "rgb(f7768e)"
 
 
 def highlight(slug=None):
-    """Outline an ego's windows on this workspace; with no slug, clear all.
+    """Outline an ego's windows on hover; with no slug, clear every one.
 
-    Used by the bar label on hover. Every window is cleared first so a missed
-    mouse-leave cannot leave a stray border behind.
+    Only the border COLOUR is touched. Setting border_size as well reflows the
+    tiling and visibly resizes windows, which is not what an outline should do.
+
+    A window hidden inside a tab group cannot show a border, so the group's
+    visible member is outlined in its place.
+
+    Every dispatch goes out in one `hyprctl --batch`. One process per window per
+    property made hovering lag badly; batched it is a single ~6ms call.
     """
     want = profiles().get(slug or "", {}).get("wm_class")
-    for c in hyprctl("clients") or []:
-        if not (c.get("class", "").startswith("chrome-")
-                or c.get("class") == "google-chrome"):
+    clients = hyprctl("clients") or []
+    by_addr = {c["address"]: c for c in clients}
+
+    targets = set()
+    if want:
+        for c in clients:
+            if c.get("class") != want:
+                continue
+            if c.get("hidden") and c.get("grouped"):
+                visible = next((a for a in c["grouped"]
+                                if by_addr.get(a) and not by_addr[a].get("hidden")), None)
+                targets.add(visible or c["address"])
+            else:
+                targets.add(c["address"])
+
+    cmds = []
+    for c in clients:
+        cls = c.get("class", "")
+        if not (cls.startswith("chrome-") or cls == "google-chrome"):
             continue
-        on = want is not None and c.get("class") == want
-        for prop, val in (("border_size", 4 if on else "unset"),
-                          ("active_border_color", HILITE if on else "unset"),
-                          ("inactive_border_color", HILITE if on else "unset")):
-            dispatch(f"hl.dsp.window.set_prop({{ window = 'address:{c['address']}', "
-                     f"prop = '{prop}', value = {val if val == 4 else repr(val)} }})")
+        value = HILITE if c["address"] in targets else "unset"
+        for prop in ("active_border_color", "inactive_border_color"):
+            cmds.append(f"dispatch hl.dsp.window.set_prop({{ window = "
+                        f"'address:{c['address']}', prop = '{prop}', "
+                        f"value = '{value}' }})")
+    if cmds:
+        subprocess.run(["hyprctl", "--batch", " ; ".join(cmds)], capture_output=True)
 
 
 def ego_options(by_class, first=()):

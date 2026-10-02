@@ -150,11 +150,18 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
+          // The hit area is the whole card - full bar height and padded either
+          // side. The glyph box alone is a few pixels tall and nearly
+          // impossible to hit while looking away at the windows.
           Text {
             text: modelData.name
             color: hover.containsMouse && root.bar ? root.bar.urgent : root.fg
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
+            height: root.barSize
+            verticalAlignment: Text.AlignVCenter
+            leftPadding: Style.space(4)
+            rightPadding: Style.space(4)
             MouseArea {
               id: hover
               anchors.fill: parent
