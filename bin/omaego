@@ -1028,6 +1028,7 @@ opens on the workspace you are on - never by switching desktops.
   omaego close <ego>     close that ego's windows on this workspace
   omaego space [--json]  which ego owns the current workspace
   omaego here [--json]   browser and web-app windows on the current workspace
+  omaego setup           first-run wiring: handler, desktop entries, rules file
   omaego sync            rewrite desktop entries, relink native messaging hosts
   omaego restructure     name each inner profile dir after its ego, so web-app
                          windows identify their ego (rarely needed)
@@ -1371,6 +1372,38 @@ def main(argv):
 
         print(f"unknown: omaego app {sub}", file=sys.stderr)
         return 2
+
+    if cmd == "setup":
+        # What install.sh does, minus the symlinks: for a packaged install the
+        # binaries are already on PATH and only the per-user wiring is missing.
+        apps = DESKTOP_DIR
+        apps.mkdir(parents=True, exist_ok=True)
+        RULES.parent.mkdir(parents=True, exist_ok=True)
+        if not RULES.exists():
+            seed = Path("/usr/share/omaego/rules.toml")
+            RULES.write_text(seed.read_text() if seed.exists() else
+                             "# omaego rules. See the README.\n")
+            print(f"  seeded {RULES}")
+        me = os.environ.get("OMAEGO_BIN", shutil.which("omaego") or "omaego")
+        shim = apps / "chromium.desktop"
+        shim.write_text("[Desktop Entry]\nType=Application\n"
+                        "Name=Chromium (omaego shim)\n"
+                        "Comment=omarchy-launch-webapp falls back here for an "
+                        "unrecognised default browser\n"
+                        f"Exec={shutil.which('omaego-webapp') or 'omaego-webapp'} %U\n"
+                        "Icon=google-chrome\nTerminal=false\nNoDisplay=true\n"
+                        "Categories=Network;WebBrowser;\n")
+        print(f"  wrote {shim}")
+        write_desktop_entries()
+        subprocess.run(["update-desktop-database", str(apps)], capture_output=True)
+        subprocess.run(["xdg-settings", "set", "default-web-browser",
+                        "omaego.desktop"], capture_output=True)
+        subprocess.run(["xdg-mime", "default", "omaego.desktop",
+                        "x-scheme-handler/http", "x-scheme-handler/https",
+                        "text/html"], capture_output=True)
+        print("  registered as default browser")
+        print("\nNext: omaego add \"Work\"   then   omaego app add work teams")
+        return 0
 
     if cmd == "sync":
         write_desktop_entries()
