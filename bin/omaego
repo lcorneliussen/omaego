@@ -988,10 +988,14 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False):
         if r.returncode != 0:
             msg = (r.stderr.strip() or r.stdout.strip() or "no output")[:140]
             print(f"  {name}: FAILED  {msg}", file=sys.stderr)
+            # Launched from the bar panel there is no terminal to read, so a
+            # failure that is only printed is a failure nobody sees.
+            notify(f"could not add {name}: {msg[:90]}")
             continue
         if not icon_arg:                       # omarchy fetched it; fix it up
             normalize_icon(ICON_DIR / f"{icon_slug}.png")
         print(f"  installed  {name}")
+        notify(f"added {name} — find it in the launcher")
 
         if want_rule and domain:
             owner = app_rule_conflict(domain)
@@ -1340,8 +1344,8 @@ def main(argv):
                 print(f"unknown ego {slug!r}", file=sys.stderr)
                 return 1
             name = profiles()[slug]["name"]
-            typed = (prompt_text(f"{name}: paste a URL, or type a name "
-                                 f"— Enter alone to browse") or "").strip()
+            typed = (prompt_text(f"{name}: paste a URL then Enter · a name then "
+                                 f"Enter · or Enter alone to browse") or "").strip()
 
             if typed:
                 hit = next((k for k, v in WEBAPPS.items()
