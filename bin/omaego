@@ -1061,12 +1061,20 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
     if url and not display:
         u = normalize_url(url)
         cands = name_candidates(u, ego["name"])
-        if len(cands) == 1:
-            display = cands[0]          # nothing to choose between; just use it
-        else:
-            choice = pick([(c, c) for c in cands], f"Name for {urlsplit(u).hostname}…")
-            if choice is None:
+        # Suggestions are rows you can pick; nothing is accepted on your behalf.
+        # A picker cannot also take free text - walker filters its rows against
+        # what is typed and returns nothing when none match - so typing another
+        # name is itself a row, which opens an input box.
+        choice = pick([(c, c) for c in cands] + [("Type another name…", "__type__")],
+                      f"Name this app ({urlsplit(u).hostname})")
+        if choice is None:
+            return 1
+        if choice == "__type__":
+            display = (prompt_text(f"Name for {urlsplit(u).hostname}") or "").strip()
+            if not display:
+                notify("cancelled: a name is needed")
                 return 1
+        else:
             display = choice
     elif display and not url:
         url = prompt_text(f"URL for {display}")
