@@ -989,8 +989,15 @@ def name_candidates(url, ego_name=None):
             host = host[len(junk):]
     parts = [p for p in host.split(".")
              if p not in ("com", "org", "net", "io", "co", "app", "de", "ai")]
+    # A first path segment is frequently the real product: google.com/maps is
+    # "Maps", not "Google". Offered alongside the host, so the choice is made
+    # rather than guessed.
+    seg = [w for w in (urlsplit(url).path or "").strip("/").split("/")[:1] if w]
+    cands = ([parts[0]] if parts else []) + (parts[1:2] if len(parts) > 1 else [])
+    if seg and seg[0].isalpha() and 2 <= len(seg[0]) <= 14:
+        cands.append(seg[0])
     out = []
-    for p in ([parts[0]] if parts else []) + (parts[1:2] if len(parts) > 1 else []):
+    for p in cands:
         n = p.replace("-", " ").title()
         # The ego is already known from the card the app is being added under,
         # so its own name is never the app's name: acme.odoo.com under the
@@ -1463,10 +1470,65 @@ def main(argv):
             print("  omaego app remove <ego> <app>...")
             print('  omaego app icon <ego> "<app name>" <image url|path|--agent>')
             print("  omaego app rebadge [ego]        stamp ego badges on icons")
+            print('  omaego app rename <ego> "<old>" "<new>"')
+            print("  omaego app fixnames [ego]       append the ego to names missing it")
             print("\n[rule] marks a host one ego can plausibly own outright; "
                   "--rule writes it.\nHosts without it are shared between egos "
                   "(Teams, Outlook, Gmail, Meet) — a rule\nthere would send a "
                   "customer's link to the wrong identity.")
+            return 0
+
+        if sub in ("rename", "fixnames"):
+            egos = profiles()
+            def do_rename(slug, app, new_name):
+                old_desktop = DESKTOP_DIR / app["desktop"]
+                old_slug = app["icon"] if app["icon"] and "/" not in app["icon"] else None
+                new_slug = re.sub(r"[^a-z0-9]+", "-", new_name.lower()).strip("-")
+                txt = old_desktop.read_text()
+                txt = re.sub(r"^Name=.*$", f"Name={new_name}", txt, flags=re.M)
+                if old_slug:
+                    for suffix in (".png", ".orig.png"):
+                        src = ICON_DIR / f"{old_slug}{suffix}"
+                        if src.exists():
+                            src.rename(ICON_DIR / f"{new_slug}{suffix}")
+                    txt = re.sub(r"^Icon=.*$", f"Icon={new_slug}", txt, flags=re.M)
+                (DESKTOP_DIR / f"{new_name}.desktop").write_text(txt)
+                if old_desktop.name != f"{new_name}.desktop":
+                    old_desktop.unlink(missing_ok=True)
+                print(f"  {app['name']}  ->  {new_name}")
+
+            if sub == "rename":
+                if len(argv) < 5:
+                    print("usage: omaego app rename <ego> \"<old>\" \"<new>\"",
+                          file=sys.stderr)
+                    return 2
+                slug, old, new = argv[2], argv[3], " ".join(argv[4:])
+                app = next((a for a in installed_apps().get(slug, [])
+                            if a["name"].lower() == old.lower()), None)
+                if app is None:
+                    print(f"no app {old!r} in {slug}", file=sys.stderr)
+                    return 1
+                do_rename(slug, app, new)
+            else:
+                # Every launcher should carry its ego, including the fallback
+                # one: "Chrome Remote Desktop" says nothing about whose it is.
+                which = argv[2] if len(argv) > 2 else None
+                n = 0
+                for slug, apps in sorted(installed_apps().items()):
+                    if (which and slug != which) or slug not in egos:
+                        continue
+                    ego_name = egos[slug]["name"]
+                    for a in apps:
+                        if re.search(rf"\b{re.escape(ego_name)}\b", a["name"], re.I):
+                            continue
+                        do_rename(slug, a, f"{a['name']} {ego_name}")
+                        n += 1
+                print(f"{n} renamed")
+            subprocess.run(["update-desktop-database", str(DESKTOP_DIR)],
+                           capture_output=True)
+            subprocess.run(["gtk-update-icon-cache",
+                            str(Path.home() / ".local/share/icons/hicolor")],
+                           capture_output=True)
             return 0
 
         if sub == "icon":
