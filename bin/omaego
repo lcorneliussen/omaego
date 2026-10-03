@@ -1767,7 +1767,10 @@ def main(argv):
         # Everything the bar panel renders, in one call - four separate
         # processes per open would be four Chrome-free but still pointless forks.
         by_class = all_targets()
-        here = {c for _, c, _ in browsers_here()}
+        rows = browsers_here()
+        here = {c for _, c, _ in rows}
+        # Which ego owns the focused window, so the bar can mark it.
+        focused_cls = next((c for a, c, f in rows if f), None)
         inst = installed_apps()
         dflt = default_slug()
         rules = [{"pattern": r.get("url") or r.get("match") or "",
@@ -1794,6 +1797,7 @@ def main(argv):
                       "color": "#" + ego_color(t["slug"]),
                       "default": t["slug"] == dflt,
                       "here": t["wm_class"] in here,
+                      "focused": t["wm_class"] == focused_cls,
                       "apps": [panel_app(a, t["name"]) for a in inst.get(t["slug"], [])],
                       "rules": [r for r in rules if owns(t, r)]}
                      for t in egos],
