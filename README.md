@@ -118,7 +118,7 @@ Everything, in one chain pinned to a reviewed commit:
 ```bash
 git clone https://github.com/lcorneliussen/omaego && \\
   cd omaego && \\
-  git checkout b8a3a3e04894be8ed88289d333d751b3485ac70f && \\
+  git checkout ef9e0643c9c47b27ef10fbb36ba45cff95a1dad0 && \\
   ./install.sh --with-plugin && \\
   omaego setup && \\
   omarchy restart shell
