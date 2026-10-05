@@ -39,6 +39,20 @@ omaego app add acme teams outlook
 omaego rule add 'https://acme.atlassian.net/*' Acme
 ```
 
+To make the profile your browser already has into an ego, as it is and
+without copying anything:
+
+```bash
+omaego add "Personal" --existing     # also what "New ego" in the panel offers
+```
+
+It becomes the fallback ego. Restart the browser once afterwards so its windows
+carry the ego's class.
+
+Each ego runs in one browser, shown on its card. `omaego add "Acme"
+--browser=brave` picks another than the default; `omaego engine acme chromium`
+(or the browser row on the card) moves an ego later, backing up what it held.
+
 `omaego add` prints those next steps for you. Nothing else on the machine shares
 that ego's cookies, extensions or sync account.
 
@@ -129,7 +143,15 @@ To run from a checkout instead, `./install.sh` symlinks `bin/` into
 Idempotent, and backs up anything it replaces. It links `bin/` into
 `~/.local/bin`, migrates `~/.config/urlrouter/rules.toml` if present, installs
 the `chromium.desktop` shim, registers omaego as the default browser, and
-relinks native-messaging hosts into every ego. `urlrouter` and `chrome-webapp`
+relinks native-messaging hosts into every ego.
+
+Egos run in **omarchy's default browser** — whatever `omarchy default browser`
+said when omaego took over, remembered in `~/.config/omaego/engine`. Chrome,
+Chromium, Brave and Edge can be the engine; Firefox cannot (no
+`--user-data-dir`, `--class` or `--app`). `omaego engine` shows which it is. To
+move to another, run `omarchy default browser <x>` and then `omaego setup`.
+An existing ego's data dir belongs to the browser that made it: logins do not
+carry over to a different engine. `urlrouter` and `chrome-webapp`
 stay as compatibility symlinks so launchers written against the old names keep
 working — `omaego-webapp` still accepts `--profile=` as well as `--ego=`.
 
@@ -193,9 +215,9 @@ Clicking opens a panel with **one column per ego**. Egos on this desktop are
 tinted. Each column shows the ego (click to open its browser here; hovering
 outlines its windows), its web apps (click to launch), the hosts that always
 open in it, and `+ Add app` / `+ Add rule`. Hover a rule to reveal its ✕. The last
-column, **New ego**, runs `omaego new`: name it in walker, and its window
+column, **New ego**, runs `omaego new`: name it in the menu, and its window
 opens so you can sign in. Rules that name no ego, such as the Zoom rewrites, are
-listed underneath. Text entry goes through walker rather than QML dialogs, so
+listed underneath. Text entry goes through the desktop menu rather than QML dialogs, so
 the picker you already know handles it and the QML stays small.
 
 Every ego has a colour. Names in the bar carry it, the panel shows it as a chip,
@@ -216,9 +238,14 @@ because they live inside the shell's own module tree.
 
 ## Requires
 
-Omarchy (tested 4.0.2 → 4.0.4), Hyprland, Google Chrome, `walker` for the
-picker, Python 3.11+ for `tomllib`. Chromium works for routing but has no Google
-sync on Arch (`signin allowed: false`), which is why Chrome is the default.
+Omarchy (tested 4.0.2 → 4.0.4), Hyprland, a Chromium-family browser as
+omarchy's default, and Python 3.11+ for `tomllib`. The picker and prompts use
+the menu the desktop already has: Omarchy 4's own (`omarchy-menu-select`), or
+`walker` on Omarchy 3. `./install.sh` and `omaego setup` say which one they
+found, or that neither is there. Tested
+with Chrome and Chromium; Brave and Edge are wired up but untested. Chromium
+has no Google sync on Arch (`signin allowed: false`), so its egos are isolated
+islands — use Chrome if each ego should sync to its own account.
 
 ## Origin
 

@@ -55,16 +55,29 @@ else
 fi
 
 echo "desktop entries:"
-sed "s#__BIN__#$BIN#g" "$REPO/share/applications/chromium.desktop" > "$APPS/chromium.desktop"
-say "wrote   $APPS/chromium.desktop  (omarchy-launch-webapp fallback shim)"
+# Must run before omaego becomes the default browser: this is where it reads
+# which browser omarchy had as default, and keeps it as the engine.
 OMAEGO_BIN="$BIN/omaego" "$BIN/omaego" sync >/dev/null
-say "wrote   omaego.desktop, google-chrome.desktop, one per ego"
+say "engine  $("$BIN/omaego" engine)"
+say "wrote   omaego.desktop, chromium.desktop (omarchy-launch-webapp shim), one per ego"
 update-desktop-database "$APPS" 2>/dev/null || true
 
 echo "default browser:"
 xdg-settings set default-web-browser omaego.desktop 2>/dev/null || true
 xdg-mime default omaego.desktop x-scheme-handler/http x-scheme-handler/https text/html
 say "now     $(xdg-settings get default-web-browser)"
+
+echo "menu:"
+# The picker and every prompt go through a menu. Without one, "New ego" and
+# "which ego for this link?" cannot ask anything.
+if command -v omarchy-menu-select >/dev/null && command -v omarchy-menu-input >/dev/null; then
+  say "ok      Omarchy's own menu"
+elif command -v walker >/dev/null; then
+  say "ok      walker"
+else
+  say "MISSING - the ego picker, \"New ego\" and every prompt need Omarchy's own"
+  say "    menu (omarchy-menu-select, Omarchy 4) or walker"
+fi
 
 if [ "${1:-}" = "--with-plugin" ]; then
   echo "bar widget:"

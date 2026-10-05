@@ -8,8 +8,8 @@ url="https://github.com/lcorneliussen/omaego"
 license=('MIT')
 depends=('python' 'hyprland' 'xdg-utils')
 optdepends=(
-  'google-chrome: the browser egos run in (chromium works, but Arch builds have no Google sync)'
-  'walker: the ego picker and prompts'
+  'google-chrome: an engine whose egos each sync to their own account (Arch chromium has no Google sync)'
+  'walker: the ego picker and prompts on Omarchy 3 (Omarchy 4 has its own menu, which is used instead)'
   'imagemagick: normalises web app icons'
   'curl: resolves shortened links before routing'
 )

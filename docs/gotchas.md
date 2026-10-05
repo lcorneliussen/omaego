@@ -18,7 +18,7 @@ Chrome 154 / omarchy 4.0.4, where the two omarchy bugs below **still stand**.
 | Chrome opens `--app=` in its **last-used profile** | Pin the ego explicitly or a web app lands wherever you last were. |
 | Links clicked **inside** Chrome | Never reach `xdg-open`, so omaego never sees them. Chrome routes them into an existing browser window of the same ego, wherever it lives. Not fixable from outside. |
 | Native messaging hosts | Resolved **relative to the user-data-dir**. A new ego sees none of `~/.config/google-chrome/NativeMessagingHosts/`, which silently breaks 1Password desktop unlock and omarchy's copy-url / yt-dlp extensions. `omaego sync` symlinks each manifest in, per *file* — Chrome creates an empty `NativeMessagingHosts` directory itself, so linking the directory fails. **Do not delete `~/.config/google-chrome`**; the symlinks point into it. |
-| Arch Chromium | `signin allowed: false` — no Google sync at all. Separate data dirs would be isolated islands. This is why Chrome is the default engine. |
+| Arch Chromium | `signin allowed: false` — no Google sync at all. Separate data dirs would be isolated islands. The engine follows omarchy's default browser, so this is a reason to make Chrome that default. |
 
 ## Omarchy
 

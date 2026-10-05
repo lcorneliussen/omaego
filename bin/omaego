@@ -60,8 +60,6 @@ def log(msg):
         pass
 
 
-CHROME = "google-chrome-stable"
-
 # The ego root keeps its historical path: each ego is a Chrome --user-data-dir,
 # and moving them would break every installed .desktop and web app for no gain.
 EGO_ROOT = Path(os.environ.get("OMAEGO_ROOT",
@@ -75,35 +73,159 @@ RULES = _RULES_NEW if _RULES_NEW.exists() or not _RULES_OLD.exists() else _RULES
 DEFAULT_MARK = EGO_ROOT / ".default"
 DESKTOP_DIR = Path.home() / ".local/share/applications"
 
-# Browsers we did not create but should still route into when one is on-screen.
-UNMANAGED = {
-    "google-chrome": ("Chrome (default)", Path.home() / ".config/google-chrome"),
-    "chromium": ("Chromium", Path.home() / ".config/chromium"),
+# --- engine -----------------------------------------------------------------
+#
+# The browser egos run in. Keyed by desktop id, because that is what omarchy
+# calls its default browser (`omarchy default browser`, xdg-settings). Only the
+# Chromium family can be an engine: an ego is a --user-data-dir with --class and
+# --app, and Firefox has none of the three.
+#   class   the anonymous window class, when --class was dropped or never given
+#   app     prefix of a web-app window's class (<prefix><host><path>-<ProfileDir>)
+#   proc    process name, for "is it still running"
+ENGINES = {
+    "google-chrome.desktop": {
+        "command": "google-chrome-stable", "name": "Google Chrome",
+        "short": "Chrome", "config": Path.home() / ".config/google-chrome",
+        "class": "google-chrome", "app": "chrome-", "proc": "chrome",
+        "icon": "google-chrome"},
+    "chromium.desktop": {
+        "command": "chromium", "name": "Chromium",
+        "short": "Chromium", "config": Path.home() / ".config/chromium",
+        "class": "chromium", "app": "chrome-", "proc": "chromium",
+        "icon": "chromium"},
+    "brave-browser.desktop": {
+        "command": "brave", "name": "Brave",
+        "short": "Brave",
+        "config": Path.home() / ".config/BraveSoftware/Brave-Browser",
+        "class": "brave-browser", "app": "brave-", "proc": "brave",
+        "icon": "brave-desktop"},
+    "microsoft-edge.desktop": {
+        "command": "microsoft-edge-stable", "name": "Microsoft Edge",
+        "short": "Edge", "config": Path.home() / ".config/microsoft-edge",
+        "class": "microsoft-edge", "app": "msedge-", "proc": "msedge",
+        "icon": "microsoft-edge"},
 }
+for _did, _e in ENGINES.items():
+    _e["id"] = _did
+ENGINE_FILE = Path.home() / ".config/omaego/engine"
+BACKUPS = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omaego/backups"
+_engine = None
+
+
+def installed_engines():
+    return [e for e in ENGINES.values() if shutil.which(e["command"])]
+
+
+def find_engine(word):
+    """An engine by any name it goes by: chrome, Chromium, brave-browser.desktop."""
+    w = (word or "").strip().lower()
+    for e in ENGINES.values():
+        if w in (e["id"], e["id"].removesuffix(".desktop"), e["short"].lower(),
+                 e["name"].lower(), e["class"], e["command"]):
+            return e
+    return None
+
+
+def xdg_default_browser():
+    try:
+        env = {k: v for k, v in os.environ.items() if k != "BROWSER"}
+        return subprocess.run(["xdg-settings", "get", "default-web-browser"],
+                              capture_output=True, text=True, env=env,
+                              timeout=5).stdout.strip()
+    except Exception:
+        return ""
+
+
+def engine():
+    """The engine a NEW ego gets: omarchy's default browser.
+
+    An existing ego keeps the one it was made in (ego_engine) until it is moved
+    with `omaego engine <ego> <browser>` - a data dir belongs to its browser.
+
+    Once omaego is itself the default browser that answer is "omaego", so the
+    last real one seen is kept in ENGINE_FILE and read back from there. Run
+    `omarchy default browser <x>` and then `omaego setup` to move to another.
+    A default that cannot be an engine (Firefox, or one that was uninstalled)
+    falls through to the remembered one, then to whatever is installed.
+    """
+    global _engine
+    if _engine:
+        return _engine
+
+    def usable(did):
+        return did in ENGINES and shutil.which(ENGINES[did]["command"])
+
+    try:
+        remembered = ENGINE_FILE.read_text().strip()
+    except OSError:
+        remembered = ""
+    current = xdg_default_browser()
+    if usable(current):
+        did, source = current, "omarchy's default browser"
+        if current != remembered:
+            try:
+                ENGINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                ENGINE_FILE.write_text(current + "\n")
+            except OSError:
+                pass
+    elif usable(remembered):
+        did, source = remembered, "omarchy's default browser before omaego took over"
+    else:
+        did = next((d for d in ENGINES if usable(d)), "google-chrome.desktop")
+        source = "first one installed" if usable(did) else "NOT INSTALLED"
+    _engine = dict(ENGINES[did], source=source)
+    return _engine
+
+
+def ego_engine(data_dir):
+    """The browser one ego runs in, from the .engine file in its data dir.
+
+    An ego from before that file existed was made in Chrome, the only engine
+    there was; without Chrome it runs in the default rather than not at all.
+    """
+    try:
+        e = ENGINES.get((data_dir / ".engine").read_text().strip())
+    except OSError:
+        e = None
+    if e:
+        return e
+    chrome = ENGINES["google-chrome.desktop"]
+    return chrome if shutil.which(chrome["command"]) else engine()
+
+
+# Browsers we did not create but should still route into when one is on-screen.
+UNMANAGED = {e["class"]: (e["short"] if e["class"] != "google-chrome"
+                          else "Chrome (default)", e["config"])
+             for e in ENGINES.values()}
+APP_PREFIXES = tuple(sorted({e["app"] for e in ENGINES.values()}))
 # Windows that look like browsers but are somebody else's tool.
 IGNORED_CLASSES = {"chromium-browser"}
 
 
+def is_browser_class(cls):
+    """An engine window: anonymous, one of our --class names, or a web app."""
+    return cls in UNMANAGED or cls.startswith(APP_PREFIXES)
+
+
 # --- profiles ---------------------------------------------------------------
 
-NM_SOURCE = Path.home() / ".config/google-chrome/NativeMessagingHosts"
-
-
-def ensure_native_hosts(data_dir):
+def ensure_native_hosts(data_dir, eng=None):
     """Give a managed data dir the native-messaging manifests.
 
     Chrome resolves user-level native messaging hosts relative to the
     user-data-dir, so a custom data dir sees none of the manifests installed
-    into ~/.config/google-chrome - which silently breaks the 1Password desktop
-    app integration and Omarchy's copy-url / yt-dlp extensions. Symlink rather
-    than copy so vendor updates to a manifest reach every profile.
+    into the engine's own config dir (~/.config/google-chrome, say) - which
+    silently breaks the 1Password desktop app integration and Omarchy's
+    copy-url / yt-dlp extensions. Symlink rather than copy so vendor updates to
+    a manifest reach every profile.
     """
-    if not NM_SOURCE.is_dir():
+    source = (eng or ego_engine(data_dir))["config"] / "NativeMessagingHosts"
+    if not source.is_dir():
         return 0
     dest = data_dir / "NativeMessagingHosts"
     dest.mkdir(parents=True, exist_ok=True)
     n = 0
-    for manifest in NM_SOURCE.glob("*.json"):
+    for manifest in source.glob("*.json"):
         link = dest / manifest.name
         if link.is_symlink() or link.exists():
             continue
@@ -145,6 +267,7 @@ def profiles():
             "wm_class": f"chrome-{slug}",
             "profile_dir": inner,
             "managed": True,
+            "engine": ego_engine(d),
         }
     return out
 
@@ -154,12 +277,21 @@ def all_targets():
     by_class = {}
     for p in profiles().values():
         by_class[p["wm_class"]] = p
+    taken = {e["class"] for e in ENGINES.values()
+             if any(p["data_dir"].is_symlink()
+                    and p["data_dir"].resolve() == e["config"].resolve()
+                    for p in by_class.values())}
     for cls, (name, cfg) in UNMANAGED.items():
-        if not (cfg and cfg.exists()):
-            continue          # browser uninstalled / data dir removed
+        if cls in taken:
+            continue
+        # "Local State", not the dir: omarchy drops NativeMessagingHosts into
+        # every browser's config dir, installed or not.
+        if not (cfg and (cfg / "Local State").exists()):
+            continue          # browser never run / data dir removed
         by_class.setdefault(cls, {
             "slug": cls, "name": name, "data_dir": cfg,
             "wm_class": cls, "profile_dir": "Default", "managed": False,
+            "engine": next(e for e in ENGINES.values() if e["class"] == cls),
         })
     return by_class
 
@@ -181,10 +313,116 @@ def internal_profiles(data_dir):
 
 
 def chrome_running():
-    return subprocess.run(["pgrep", "-x", "chrome"], capture_output=True).returncode == 0
+    return any(subprocess.run(["pgrep", "-x", e["proc"]],
+                              capture_output=True).returncode == 0
+               for e in ENGINES.values())
 
 
-def import_profile(data_dir, subdir, name=None):
+def ego_running(data_dir):
+    """Whether a browser process holds this data dir open."""
+    # The browser's own lock, a symlink named host-pid: it is there however the
+    # browser was started, which a search for --user-data-dir is not.
+    try:
+        pid = os.readlink(data_dir / "SingletonLock").rsplit("-", 1)[1]
+    except (OSError, IndexError):
+        return False
+    return Path(f"/proc/{pid}").exists()
+
+
+def set_engine(slug, eng, profile="keep"):
+    """Move one ego to another browser. Returns the backup path, or None.
+
+    profile is what the ego holds afterwards:
+      "keep"           its own data, opened by the new browser
+      "empty"          nothing - a fresh profile
+      (dir, subdir)    a copy of a profile that browser already has
+    Whatever it held before is kept under BACKUPS first. Bookmarks, history,
+    extensions and settings survive a "keep"; cookies and saved passwords do
+    not, because each browser encrypts them with its own keyring entry.
+    """
+    ego = profiles().get(slug)
+    if not ego:
+        raise SystemExit(f"unknown ego {slug!r}")
+    d = ego["data_dir"]
+    if profile == "keep" and eng["id"] == ego["engine"]["id"]:
+        (d / ".engine").write_text(eng["id"] + "\n")
+        return None
+    if ego_running(d):
+        raise SystemExit(f"{ego['name']} is open - close all its windows first")
+    backup = None
+    if d.is_symlink():
+        # An adopted ego: the browser's own profile stays where it is, as the
+        # rollback, and the ego gets a data dir of its own from here on.
+        backup = d.resolve()
+        d.unlink()
+        if profile == "keep":
+            subprocess.run(["cp", "-a", "--reflink=auto", str(backup), str(d)],
+                           check=True)
+    elif any(c for c in d.iterdir() if not c.name.startswith(".")):
+        BACKUPS.mkdir(parents=True, exist_ok=True)
+        backup = BACKUPS / f"{slug}-{ego['engine']['short'].lower()}-{int(time.time())}"
+        if profile == "keep":
+            subprocess.run(["cp", "-a", "--reflink=auto", str(d), str(backup)],
+                           check=True)
+        else:
+            d.rename(backup)
+    if profile != "keep":
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ".profile-name").write_text(ego["name"] + "\n")
+        if backup and (backup / ".ego-color").exists():
+            shutil.copy(backup / ".ego-color", d / ".ego-color")
+        (d / ".profile-dir").unlink(missing_ok=True)
+        if profile != "empty":
+            src_dir, sub = profile
+            subprocess.run(["cp", "-a", "--reflink=auto", str(Path(src_dir) / sub),
+                            str(d / "Default")], check=True)
+    # A lock or a host manifest left by the old browser would point the new one
+    # at a process and a config dir that are not its own.
+    for stale in list(d.glob("Singleton*")) + list(d.glob("NativeMessagingHosts/*.json")):
+        if stale.is_symlink():
+            stale.unlink()
+    (d / ".engine").write_text(eng["id"] + "\n")
+    ensure_native_hosts(d, eng)
+    write_desktop_entries()
+    return backup
+
+
+def pick_engine(slug):
+    """The ego card's browser row: choose a browser, then what it should hold."""
+    ego = profiles().get(slug)
+    if not ego:
+        return 1
+    cur = ego["engine"]
+    eng = pick([(e["name"] + ("   (current)" if e["id"] == cur["id"] else ""), e)
+                for e in installed_engines()], f"Browser for {ego['name']}")
+    if not eng:
+        return 0
+    rows = []
+    if eng["id"] != cur["id"]:
+        rows.append((f"Keep {ego['name']}'s profile (bookmarks, history, "
+                     f"extensions; sign in again)", "keep"))
+    rows += [(f"Copy of {eng['short']}'s own profile: {nm}", (eng["config"], sub))
+             for sub, nm in internal_profiles(eng["config"])]
+    rows.append(("Empty profile", "empty"))
+    profile = pick(rows, f"Profile for {ego['name']} in {eng['short']}")
+    if not profile:
+        return 0
+    if isinstance(profile, tuple) and subprocess.run(
+            ["pgrep", "-x", eng["proc"]], capture_output=True).returncode == 0:
+        notify(f"Quit {eng['short']} completely first - its profile cannot be "
+               f"copied while it is open")
+        return 1
+    try:
+        backup = set_engine(slug, eng, profile)
+    except SystemExit as e:
+        notify(str(e))
+        return 1
+    notify(f"{ego['name']} now runs in {eng['short']}"
+           + (f" - previous profile kept in {backup}" if backup else ""))
+    return 0
+
+
+def import_profile(data_dir, subdir, name=None, eng=None):
     """Copy a Chrome-internal profile out into its own user-data-dir."""
     src = data_dir / subdir
     if not src.is_dir():
@@ -203,6 +441,7 @@ def import_profile(data_dir, subdir, name=None):
     print(f"copying {src} -> {dest / 'Default'} ...")
     subprocess.run(["cp", "-a", str(src), str(dest / "Default")], check=True)
     (dest / ".profile-name").write_text(name + "\n")
+    (dest / ".engine").write_text((eng or engine())["id"] + "\n")
     ensure_native_hosts(dest)
     write_desktop_entries()
     print(f"imported {name!r} as {slug} (class chrome-{slug})")
@@ -210,13 +449,48 @@ def import_profile(data_dir, subdir, name=None):
     return slug
 
 
-def add_profile(name):
+def adopted():
+    """Egos that ARE a browser's own profile: {engine class: ego}.
+
+    Such an ego's data dir is a symlink to the browser's config dir, so the
+    profile you already set up becomes an ego without copying or moving it.
+    """
+    out = {}
+    for ego in profiles().values():
+        if ego["data_dir"].is_symlink():
+            real = ego["data_dir"].resolve()
+            for e in ENGINES.values():
+                if e["config"].resolve() == real:
+                    out[e["class"]] = ego
+    return out
+
+
+def adoptable():
+    """Installed browsers with a profile of their own that is not an ego yet."""
+    taken = adopted()
+    return [e for e in installed_engines()
+            if e["class"] not in taken and (e["config"] / "Local State").exists()]
+
+
+def add_profile(name, eng=None, existing=False):
+    """A new ego: empty, or (existing=True) the browser's own profile, adopted."""
     slug = slugify(name)
     d = PROFILE_ROOT / slug
     if d.exists():
         return slug
-    d.mkdir(parents=True)
+    eng = eng or engine()
+    if existing:
+        if eng["id"] not in {e["id"] for e in adoptable()}:
+            raise SystemExit(f"{eng['short']} has no profile of its own to adopt")
+        PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
+        d.symlink_to(eng["config"], target_is_directory=True)
+        # The profile you already use is the natural fallback ego.
+        if not default_slug():
+            DEFAULT_MARK.write_text(slug + "\n")
+    else:
+        d.mkdir(parents=True)
     (d / ".profile-name").write_text(name + "\n")
+    (d / ".engine").write_text(eng["id"] + "\n")
     ensure_native_hosts(d)
     write_desktop_entries()
     return slug
@@ -270,6 +544,7 @@ def browsers_here():
     known = all_targets()
     by_dir = {str(t["data_dir"]).rstrip("/"): t["wm_class"]
               for t in known.values() if t["managed"] and t["data_dir"]}
+    own = adopted()
     found = []
     # Reading order, so the ego whose window sits first in the tiling is named
     # first - and is therefore the one a link defaults to.
@@ -279,12 +554,16 @@ def browsers_here():
         cls = c.get("class", "")
         if cls in IGNORED_CLASSES or c.get("workspace", {}).get("id") != ws:
             continue
-        if not (cls in known or cls.startswith("chrome-") or cls == "google-chrome"):
+        if not (cls in known or is_browser_class(cls)):
             continue
         # Prefer the process's data dir over the window class: an instance first
         # launched without --class (a web app at login, say) gives every browser
         # window the anonymous class google-chrome, but its data dir is exact.
         prof = by_dir.get(window_data_dir(c.get("pid")) or "")
+        if prof is None and cls in own:
+            # An adopted browser started the plain way: no --user-data-dir on
+            # its command line, but its own class says which ego it is.
+            prof = own[cls]["wm_class"]
         if prof is None:
             prof = cls if cls in known else None
         if prof is None:
@@ -293,10 +572,11 @@ def browsers_here():
         # never somewhere to put a link - Chrome cannot add a tab to an --app
         # window and silently opens a whole new browser window instead.
         # Detect by elimination: our own browser classes are exactly the known
-        # ones, so any other chrome-* class is an app window. Matching the class
+        # ones, so any other chrome-* class (brave-*, msedge-* under those
+        # engines) is an app window. Matching the class
         # shape instead fails for apps whose URL has a path, e.g.
         # chrome-outlook.office.com__mail_-Default.
-        is_app = cls.startswith("chrome-") and cls not in known
+        is_app = cls.startswith(APP_PREFIXES) and cls not in known
         found.append((None if is_app else c["address"], prof,
                       (not is_app) and c["address"] == active))
     return found
@@ -323,6 +603,26 @@ def focus(address, confirm=True):
 
 # --- picker -----------------------------------------------------------------
 
+def picker():
+    """Which menu there is to ask with: "omarchy", "walker", or None.
+
+    Whatever the desktop itself uses: Omarchy 4's own shell menu
+    (omarchy-menu-select and -input) where it exists, walker on Omarchy 3,
+    which shipped that instead. Neither is guaranteed, and asking with a menu
+    that is not there used to look exactly like the user pressing Escape - so
+    callers that must not lose what they were asked to do check this first.
+    """
+    if shutil.which("omarchy-menu-select") and shutil.which("omarchy-menu-input"):
+        return "omarchy"
+    if shutil.which("walker"):
+        return "walker"
+    return None
+
+
+NO_MENU = ("omaego has no menu to ask with: neither Omarchy's own "
+           "(omarchy-menu-select) nor walker is installed")
+
+
 def pick(options, prompt, free=False):
     """options: list of (label, value). Returns value, or None.
 
@@ -334,13 +634,27 @@ def pick(options, prompt, free=False):
         return None
     labels = "\n".join(label for label, _ in options)
     log(f"pick: offering {labels!r}")
+    if not picker():
+        # Silence here read as "nothing happened" - the one thing a click on
+        # "New ego" must never look like.
+        log("pick: no menu installed")
+        notify(NO_MENU)
+        print(NO_MENU, file=sys.stderr)
+        return None
     try:
-        r = subprocess.run(
-            ["walker", "--dmenu", "-X", "--placeholder", prompt],
-            input=labels, capture_output=True, text=True, timeout=120,
-        )
+        if picker() == "omarchy":
+            r = subprocess.run(
+                ["omarchy-menu-select", prompt, *(label for label, _ in options)],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=120,
+            )
+        else:
+            r = subprocess.run(
+                ["walker", "--dmenu", "-X", "--placeholder", prompt],
+                input=labels, capture_output=True, text=True, timeout=120,
+            )
     except Exception as e:
-        log(f"pick: walker failed {e!r}")
+        log(f"pick: menu failed {e!r}")
         return None
     log(f"pick: rc={r.returncode} out={r.stdout!r} err={r.stderr[:200]!r}")
     chosen = r.stdout.strip()
@@ -354,12 +668,23 @@ def pick(options, prompt, free=False):
 
 
 def prompt_text(prompt):
+    if not picker():
+        log("prompt: no menu installed")
+        notify(NO_MENU)
+        print(NO_MENU, file=sys.stderr)
+        return None
     try:
-        r = subprocess.run(
-            ["walker", "--dmenu", "--inputonly", "--placeholder", prompt],
-            input="", capture_output=True, text=True, timeout=120,
-        )
-    except Exception:
+        if picker() == "omarchy":
+            r = subprocess.run(["omarchy-menu-input", prompt],
+                               stdin=subprocess.DEVNULL, capture_output=True,
+                               text=True, timeout=120)
+        else:
+            r = subprocess.run(
+                ["walker", "--dmenu", "--inputonly", "--placeholder", prompt],
+                input="", capture_output=True, text=True, timeout=120,
+            )
+    except Exception as e:
+        log(f"prompt: menu failed {e!r}")
         return None
     return r.stdout.strip() or None
 
@@ -478,7 +803,7 @@ def match_rule(url, source_class):
 # --- launching --------------------------------------------------------------
 
 def launch(target, url=None, new_window=False, incognito=False, as_app=False):
-    cmd = [CHROME, "--no-first-run", "--no-default-browser-check"]
+    cmd = [target["engine"]["command"], "--no-first-run", "--no-default-browser-check"]
     if target["managed"]:
         cmd += [f"--user-data-dir={target['data_dir']}", f"--class={target['wm_class']}"]
         if target.get("profile_dir", "Default") != "Default":
@@ -609,7 +934,7 @@ def highlight(mode=None):
     cmds = []
     for c in clients:
         cls = c.get("class", "")
-        if not (cls.startswith("chrome-") or cls == "google-chrome"):
+        if not is_browser_class(cls):
             continue
         colour = want.get(c["address"])
         # Only the INACTIVE colour. Setting the active one too made a focused
@@ -645,7 +970,7 @@ def close_ego(slug):
         if c.get("workspace", {}).get("id") != ws:
             continue
         cls = c.get("class", "")
-        if not (cls.startswith("chrome-") or cls == "google-chrome"):
+        if not is_browser_class(cls):
             continue
         if window_data_dir(c.get("pid")) == want_dir or cls == prof["wm_class"]:
             cmds.append(f"dispatch hl.dsp.window.close({{ window = "
@@ -672,14 +997,37 @@ def ego_options(by_class, first=()):
     return rows
 
 
+def new_ego():
+    """Ask for a name, and for what the ego should be when there is a choice.
+
+    Returns (slug, existed), or None if cancelled. The choice is one menu, not
+    two: every installed browser with an empty profile, plus "the profile I
+    already have" for a browser whose own profile is not an ego yet.
+    """
+    name = prompt_text("Name for the new ego")
+    if not name:
+        return None
+    if slugify(name) in profiles():
+        return slugify(name), True
+    rows = [(f"{e['name']} - the profile I already use", (e, True))
+            for e in adoptable()]
+    # The default browser first among the empty ones, so Enter is "the usual".
+    rows += [(f"{e['name']} - new, empty profile", (e, False))
+             for e in sorted(installed_engines(),
+                             key=lambda e: e["id"] != engine()["id"])]
+    eng, existing = (rows[0][1] if len(rows) == 1 else
+                     pick(rows, f"What should {name} be?") or (None, None))
+    if not eng:
+        return None
+    return add_profile(name, eng, existing), False
+
+
 def resolve_choice(chosen):
     """Turn a picker result into a target, creating an ego if asked."""
     if chosen != "__new__":
         return chosen
-    name = prompt_text("Name for the new ego")
-    if not name:
-        return None
-    return profiles()[add_profile(name)]
+    made = new_ego()
+    return profiles()[made[0]] if made else None
 
 
 def open_url(url=None, incognito=False):
@@ -732,6 +1080,13 @@ def open_url(url=None, incognito=False):
             why = why or "workspace"
 
     # 3. Nothing here: ask which ego to start on this desktop.
+    if target is None and by_class and (len(by_class) == 1 or not picker()):
+        # One place it could go, or no menu to ask with: open it rather than
+        # drop it. The fallback ego if there is one, else the first there is.
+        target = next((t for t in by_class.values()
+                       if t["slug"] == default_slug()),
+                      sorted(by_class.values(), key=lambda t: t["name"])[0])
+        why = why or "only choice"
     if target is None:
         chosen = pick(ego_options(by_class),
                       "No ego on this desktop — open link in…")
@@ -770,39 +1125,78 @@ def open_url(url=None, incognito=False):
 def write_desktop_entries():
     DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
     me = os.environ.get("OMAEGO_BIN", str(Path.home() / ".local/bin/omaego"))
+    eng = engine()
     (DESKTOP_DIR / "omaego.desktop").write_text(f"""[Desktop Entry]
 Type=Application
 Name=omaego
 Comment=Open links in the ego whose browser is already on this desktop
 Exec={me} %u
-Icon=google-chrome
+Icon={eng['icon']}
 Terminal=false
 NoDisplay=true
 MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;
 """)
     dflt = default_slug()
-    for slug, p in profiles().items():
+    egos = profiles()
+    # omarchy-launch-webapp sends every default browser it does not recognise -
+    # omaego included - to chromium.desktop, keeps only the first token of its
+    # Exec= and appends --app=<url>. So that file has to be ours, and has to
+    # start with omaego-webapp. It shadows the real Chromium entry, so when
+    # Chromium is the engine it doubles as the plain browser entry instead of
+    # hiding the browser from the launcher.
+    sibling = Path(me).parent / "omaego-webapp"
+    webapp = str(sibling) if sibling.exists() else (
+        shutil.which("omaego-webapp") or "omaego-webapp")
+    # The plain browser entry is the fallback ego's browser, if there is one.
+    plain_id = egos[dflt]["engine"]["id"] if dflt in egos else eng["id"]
+    plain = plain_id == "chromium.desktop"
+    owner = egos.get(dflt) if plain else None
+    (DESKTOP_DIR / "chromium.desktop").write_text(f"""[Desktop Entry]
+Type=Application
+Name={"Chromium" if plain else "Chromium (omaego shim)"}
+Comment={f"Personal profile ({owner['name']})" if owner else "omarchy-launch-webapp falls back here; omaego-webapp gives the web app an ego"}
+Exec={webapp} %U
+Icon={ENGINES["chromium.desktop"]["icon"] if plain else eng['icon']}
+Terminal=false
+Categories=Network;WebBrowser;
+{f"StartupWMClass={owner['wm_class']}" if owner else ""}
+{"" if plain else "NoDisplay=true"}
+""")
+    # A plain entry written for an engine we have since moved off would keep
+    # shadowing that browser's own.
+    for did in ENGINES:
+        f = DESKTOP_DIR / did
+        if did in (plain_id, "chromium.desktop") or not f.exists():
+            continue
+        try:
+            if re.search(r"^Exec=.*omaego", f.read_text(), re.M):
+                f.unlink()
+        except OSError:
+            pass
+    for slug, p in egos.items():
         ensure_native_hosts(p["data_dir"])
         is_default = slug == dflt
-        # The default profile owns the plain "Google Chrome" entry, and its own
-        # per-profile entry is hidden so the launcher does not show both.
+        own = p["engine"]
+        # The default profile owns the engine's plain entry ("Google Chrome"),
+        # and its own per-profile entry is hidden so the launcher does not show
+        # both.
         (DESKTOP_DIR / f"chrome-{slug}.desktop").write_text(f"""[Desktop Entry]
 Type=Application
-Name=Chrome {p['name']}
+Name={own['short']} {p['name']}
 Exec={me} launch {slug} %U
-Icon=google-chrome
+Icon={own['icon']}
 Terminal=false
 StartupWMClass={p['wm_class']}
 Categories=Network;WebBrowser;
 {"NoDisplay=true" if is_default else ""}
 """)
-        if is_default:
-            (DESKTOP_DIR / "google-chrome.desktop").write_text(f"""[Desktop Entry]
+        if is_default and not plain:
+            (DESKTOP_DIR / own["id"]).write_text(f"""[Desktop Entry]
 Type=Application
-Name=Google Chrome
+Name={own['name']}
 Comment=Personal profile ({p['name']})
 Exec={me} launch {slug} %U
-Icon=google-chrome
+Icon={own['icon']}
 Terminal=false
 StartupWMClass={p['wm_class']}
 Categories=Network;WebBrowser;
@@ -1124,7 +1518,7 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
             # back to a generic picture.
             host = urlsplit(app_url).hostname
             # Only ask where someone is there to answer. A scripted `app add`
-            # would otherwise sit on this prompt until walker times out.
+            # would otherwise sit on this prompt until the menu times out.
             given = None
             if interactive:
                 choice = pick([("Paste an image URL…", "url"),
@@ -1134,7 +1528,7 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
                 if choice == "url":
                     given = prompt_text(f"Image URL for {name}")
                 elif choice == "agent":
-                    r = run_install("google-chrome")
+                    r = run_install(ego_engine(PROFILE_ROOT / slug)["icon"])
                     if r.returncode == 0 and agent_find_icon(slug, name, app_url):
                         print(f"  {name}: installed; the agent is finding an icon")
                         notify(f"added {name} — the agent is finding an icon")
@@ -1146,9 +1540,9 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
                     r = run_install(icon_arg)
                 else:
                     notify(f"could not use that image; falling back")
-                    r = run_install("google-chrome")
+                    r = run_install(ego_engine(PROFILE_ROOT / slug)["icon"])
             else:
-                r = run_install("google-chrome")
+                r = run_install(ego_engine(PROFILE_ROOT / slug)["icon"])
             if r.returncode == 0 and icon_arg != icon_slug:
                 print(f"  {name}: installed with a generic icon "
                       f"(none reachable at {host}); set one later with:")
@@ -1196,8 +1590,12 @@ opens on the workspace you are on - never by switching desktops.
   omaego                 open a browser on this desktop
   omaego list            show egos, and which Chrome-internal profiles are not
                          routable on their own
-  omaego add <name>      create an empty ego
-  omaego new             same, asking the name in walker, then open it to sign in
+  omaego add <name> [--browser=chrome|chromium|brave|edge] [--existing]
+                         create an empty ego, in omarchy's default browser
+                         unless another is named. --existing makes the ego out
+                         of the profile that browser already has, in place
+  omaego new             same, asking the name (and the browser, if there is a
+                         choice) in the menu, then open it to sign in
   omaego import <src> [name]
                          lift a Chrome-internal profile into its own ego
                          (needs Chrome fully quit)
@@ -1212,8 +1610,15 @@ opens on the workspace you are on - never by switching desktops.
   omaego app icon <ego> "<app name>" <image url|path|--agent>
   omaego app rebadge [ego]        stamp ego badges on installed app icons
   omaego launch <slug> [url]
-  omaego default [slug]  show/set the FALLBACK ego: the one that owns plain
-                         "Google Chrome" and web apps. Not an "active" ego -
+  omaego engine          the browser each ego runs in. A new ego gets omarchy's
+                         default browser; after `omarchy default browser <x>`,
+                         run `omaego setup` to put omaego back in front of it
+  omaego engine <ego> <browser> [empty]
+                         move an ego to another browser, keeping its profile
+                         (or starting empty). The old one is backed up first.
+  omaego engine pick <ego>        the same, choosing browser and profile in the menu
+  omaego default [slug]  show/set the FALLBACK ego: the one that owns the plain
+                         browser entry and web apps. Not an "active" ego -
                          there is no such thing; the workspace is the unit.
   omaego close <ego>     close that ego's windows on this workspace
   omaego space [--json]  which ego owns the current workspace
@@ -1230,7 +1635,7 @@ Rules: ~/.config/omaego/rules.toml
 
 # Read-only queries the bar widget polls several times a minute. Logging them
 # would churn the routing history out of the log's size cap within the hour.
-QUIET = {"space", "here", "list", "default", "panel", "highlight", "--help", "-h"}
+QUIET = {"space", "here", "list", "default", "engine", "panel", "highlight", "--help", "-h"}
 
 
 def main(argv):
@@ -1246,6 +1651,9 @@ def main(argv):
     want_json = "--json" in argv
     incognito = any(a in ("--incognito", "--private", "--private-window",
                           "--inprivate") for a in argv)
+    browser_arg = next((a.split("=", 1)[1] for a in argv
+                        if a.startswith("--browser=")), None)
+    existing_arg = "--existing" in argv
     argv = [a for a in argv if not a.startswith("-")]
 
     if not argv:
@@ -1259,13 +1667,15 @@ def main(argv):
             dflt = default_slug()
             print(json.dumps([
                 {"slug": t["slug"], "name": t["name"], "class": t["wm_class"],
-                 "managed": t["managed"], "default": t["slug"] == dflt}
+                 "managed": t["managed"], "default": t["slug"] == dflt,
+                 "browser": t["engine"]["short"]}
                 for t in sorted(by_class.values(),
                                 key=lambda t: (not t["managed"], t["name"]))]))
             return 0
         for t in sorted(by_class.values(), key=lambda t: (not t["managed"], t["name"])):
             kind = "routable" if t["managed"] else "shared data dir"
-            print(f"{t['name']:<24} class={t['wm_class']:<22} {kind}")
+            print(f"{t['name']:<24} {t['engine']['short']:<9} "
+                  f"class={t['wm_class']:<22} {kind}")
             if not t["managed"] and t["data_dir"]:
                 inner = internal_profiles(t["data_dir"])
                 for sub, nm in inner:
@@ -1280,7 +1690,8 @@ def main(argv):
     if cmd == "import":
         by_class = all_targets()
         if len(argv) < 2:
-            print("usage: omaego import <google-chrome|chromium> [ego name]",
+            have = "|".join(c for c in by_class if c in UNMANAGED)
+            print(f"usage: omaego import <{have or 'google-chrome|chromium'}> [ego name]",
                   file=sys.stderr)
             return 2
         src = by_class.get(argv[1])
@@ -1300,15 +1711,32 @@ def main(argv):
             print(f"no ego named {want!r}; try: omaego import {argv[1]}",
                   file=sys.stderr)
             return 1
-        import_profile(src["data_dir"], match[0][0], match[0][1])
+        import_profile(src["data_dir"], match[0][0], match[0][1], src["engine"])
         return 0
 
     if cmd == "add":
         if len(argv) < 2:
-            print("usage: urlrouter add <name>", file=sys.stderr)
+            print("usage: omaego add <name> [--browser=<browser>] [--existing]",
+                  file=sys.stderr)
             return 2
+        eng = find_engine(browser_arg) if browser_arg else None
+        if browser_arg and not (eng and shutil.which(eng["command"])):
+            print(f"no such browser installed: {browser_arg!r} (have: "
+                  f"{', '.join(e['short'].lower() for e in installed_engines())})",
+                  file=sys.stderr)
+            return 1
         name = " ".join(argv[1:])
-        slug = add_profile(name)
+        if slugify(name) in profiles():
+            print(f"ego {slugify(name)!r} already exists", file=sys.stderr)
+            return 1
+        slug = add_profile(name, eng, existing_arg)
+        if existing_arg:
+            ego = profiles()[slug]
+            print(f"{name} is now {ego['engine']['short']}'s own profile "
+                  f"({ego['data_dir'].resolve()}), nothing copied.")
+            print(f"Restart {ego['engine']['short']} once so its windows carry "
+                  f"the ego's class.")
+            return 0
         print(f"created ego {slug!r} ({name})\n")
         print("next:")
         print(f"  1. omaego launch {slug}")
@@ -1320,16 +1748,16 @@ def main(argv):
         return 0
 
     if cmd == "new":
-        # Interactive add, for the bar panel: name it in walker, then open it so
+        # Interactive add, for the bar panel: name it in the menu, then open it so
         # the first thing you do is sign in - an ego is only useful once synced.
-        name = prompt_text("Name for the new ego")
-        if not name:
+        made = new_ego()
+        if not made:
             return 0
-        existed = slugify(name) in profiles()
-        slug = add_profile(name)
-        launch(profiles()[slug], new_window=True)
-        notify(f"{name}: already existed, opened it" if existed
-               else f"created {name} - sign in to its Google/Microsoft account")
+        slug, existed = made
+        ego = profiles()[slug]
+        launch(ego, new_window=True)
+        notify(f"{ego['name']}: already existed, opened it" if existed
+               else f"created {ego['name']} in {ego['engine']['short']}")
         return 0
 
     if cmd == "launch":
@@ -1716,17 +2144,24 @@ def main(argv):
             RULES.write_text(seed.read_text() if seed.exists() else
                              "# omaego rules. See the README.\n")
             print(f"  seeded {RULES}")
-        me = os.environ.get("OMAEGO_BIN", shutil.which("omaego") or "omaego")
-        shim = apps / "chromium.desktop"
-        shim.write_text("[Desktop Entry]\nType=Application\n"
-                        "Name=Chromium (omaego shim)\n"
-                        "Comment=omarchy-launch-webapp falls back here for an "
-                        "unrecognised default browser\n"
-                        f"Exec={shutil.which('omaego-webapp') or 'omaego-webapp'} %U\n"
-                        "Icon=google-chrome\nTerminal=false\nNoDisplay=true\n"
-                        "Categories=Network;WebBrowser;\n")
-        print(f"  wrote {shim}")
+        # Read the engine before taking over as default browser: afterwards
+        # xdg-settings only ever answers "omaego".
+        was = xdg_default_browser()
+        eng = engine()
+        if was not in ENGINES and was != "omaego.desktop":
+            print(f"  {was or 'the default browser'} cannot hold egos "
+                  f"(Chromium family only)")
+        print(f"  engine: {eng['name']} ({eng['source']})")
+        menu = picker()
+        if menu:
+            print(f"  menu:   {'Omarchy' if menu == 'omarchy' else 'walker'}")
+        else:
+            print("  menu:   MISSING. The ego picker, \"New ego\" and every prompt "
+                  "need Omarchy's")
+            print("          own menu (omarchy-menu-select, Omarchy 4) or walker")
+        os.environ.setdefault("OMAEGO_BIN", shutil.which("omaego") or "omaego")
         write_desktop_entries()
+        print(f"  wrote desktop entries in {apps}")
         subprocess.run(["update-desktop-database", str(apps)], capture_output=True)
         subprocess.run(["xdg-settings", "set", "default-web-browser",
                         "omaego.desktop"], capture_output=True)
@@ -1734,8 +2169,50 @@ def main(argv):
                         "x-scheme-handler/http", "x-scheme-handler/https",
                         "text/html"], capture_output=True)
         print("  registered as default browser")
-        print("\nNext: omaego add \"Work\"   then   omaego app add work teams")
+        if not profiles() and eng["id"] in {e["id"] for e in adoptable()}:
+            print(f"\nNext: omaego add \"Personal\" --existing   "
+                  f"(your {eng['short']} profile, as it is, becomes the first ego)")
+            print("      omaego add \"Work\"   then   omaego app add work teams")
+        else:
+            print("\nNext: omaego add \"Work\"   then   omaego app add work teams")
         return 0
+
+    if cmd == "engine":
+        eng = engine()
+        egos = profiles()
+        if argv[1:2] == ["command"]:
+            # For omaego-webapp: the browser of one ego, or the default.
+            own = egos[argv[2]]["engine"] if argv[2:3] and argv[2] in egos else eng
+            print(own["command"])
+            return 0
+        if argv[1:2] == ["pick"] and len(argv) > 2:
+            return pick_engine(argv[2])
+        if len(argv) > 2:
+            to = find_engine(argv[2])
+            if argv[1] not in egos:
+                print(f"unknown ego {argv[1]!r}", file=sys.stderr)
+                return 1
+            if not (to and shutil.which(to["command"])):
+                print(f"no such browser installed: {argv[2]!r} (have: "
+                      f"{', '.join(e['short'].lower() for e in installed_engines())})",
+                      file=sys.stderr)
+                return 1
+            was = egos[argv[1]]["engine"]
+            empty = argv[3:4] == ["empty"]
+            backup = set_engine(argv[1], to, "empty" if empty else "keep")
+            print(f"{egos[argv[1]]['name']}: {was['short']} -> {to['short']}"
+                  + (", empty profile" if empty else ""))
+            if backup:
+                print(f"  previous profile kept in {backup}")
+            if was["id"] != to["id"] and not empty:
+                print("  bookmarks, history, extensions and settings came along;")
+                print("  cookies and saved passwords did not - sign in again")
+            return 0
+        print(f"default: {eng['name']}  ({eng['command']})  - {eng['source']}")
+        for t in sorted(egos.values(), key=lambda t: t["name"]):
+            missing = "" if shutil.which(t["engine"]["command"]) else "  NOT INSTALLED"
+            print(f"  {t['name']:<22} {t['engine']['name']}{missing}")
+        return 0 if shutil.which(eng["command"]) else 1
 
     if cmd == "sync":
         write_desktop_entries()
@@ -1866,6 +2343,7 @@ def main(argv):
             "egos": [{"slug": t["slug"], "name": t["name"], "class": t["wm_class"],
                       "color": "#" + ego_color(t["slug"]),
                       "default": t["slug"] == dflt,
+                      "browser": t["engine"]["short"],
                       "here": t["wm_class"] in here,
                       "focused": t["wm_class"] == focused_cls,
                       "apps": [panel_app(a, t["name"]) for a in inst.get(t["slug"], [])],

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch a Chrome web app pinned to one ego.
+# Launch a web app pinned to one ego.
 #
 #   omaego-webapp --ego=<slug> --app=https://...     pin to one ego
 #   omaego-webapp --app=https://...                  use the fallback ego
@@ -26,6 +26,11 @@ for a in "$@"; do
 done
 [ -z "$SLUG" ] && SLUG=$(cat "$ROOT/.default" 2>/dev/null)
 
+# Each ego runs in its own browser; omaego knows which. Without an ego it is
+# omarchy's default browser.
+ENGINE=$("$(dirname "$(readlink -f "$0")")/omaego" engine command $SLUG 2>/dev/null)
+: "${ENGINE:=google-chrome-stable}"
+
 if [ -n "$SLUG" ] && [ -d "$ROOT/$SLUG" ]; then
   PDIR=$(cat "$ROOT/$SLUG/.profile-dir" 2>/dev/null)
   PD=()
@@ -34,9 +39,10 @@ if [ -n "$SLUG" ] && [ -d "$ROOT/$SLUG" ]; then
   # data dir it fixes the class of every BROWSER window that instance later
   # opens (a link clicked inside the web app). Without it those windows come out
   # as plain google-chrome and routing cannot tell which ego they belong to.
-  exec google-chrome-stable --user-data-dir="$ROOT/$SLUG" "${PD[@]}" \
+  exec "$ENGINE" --user-data-dir="$ROOT/$SLUG" "${PD[@]}" \
     --class="chrome-$SLUG" \
     --no-first-run --no-default-browser-check "${ARGS[@]}"
 fi
-echo "omaego-webapp: unknown ego '$SLUG'" >&2
-exec google-chrome-stable --no-first-run --no-default-browser-check "${ARGS[@]}"
+# No ego named and no fallback ego: the engine's own, unmanaged profile.
+[ -n "$SLUG" ] && echo "omaego-webapp: unknown ego '$SLUG'" >&2
+exec "$ENGINE" --no-first-run --no-default-browser-check "${ARGS[@]}"
