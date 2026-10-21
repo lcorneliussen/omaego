@@ -30,16 +30,36 @@ Chrome 154 / omarchy 4.0.4, where the two omarchy bugs below **still stand**.
 | Web-app icon fetch | Can return a **JPEG saved with a `.png` extension**, or a 512px file in the 256px directory. Check with `file`. To drop a white background without eating white *inside* the logo, flood-fill from the corner: `-fuzz 8% -fill none -floodfill +0+0 white`. |
 | Moving a widget between bar sections — or any edit to it | Needs `omarchy restart shell`. A hot reload reloads plugin *code* only — the widget is never re-instantiated in its new section, so it silently does not render while the log cheerfully reports "Local plugin changed, reloading" and the plugin lists as enabled. Nothing in the logs says anything is wrong. |
 | Checking a bar widget works | "Loads without errors" and "is polling its command" are both true of a widget that draws nothing. Screenshot the bar (`grim -g "0,0 900x36"`) and look. |
-| Plugins | Six kinds (`bar`, `bar-widget`, `menu`, `overlay`, `panel`, `service`), all QML, with **no install hook** — a plugin cannot place a binary or claim `x-scheme-handler/https`. The CLI therefore cannot be a plugin; only the bar widget can. Symlinks anywhere inside a plugin folder are refused, so `install.sh` copies the plugin rather than linking it. |
+| Plugins | Six kinds (`bar`, `bar-widget`, `menu`, `overlay`, `panel`, `service`), all QML, with **no install hook** — a plugin cannot place a binary or claim `x-scheme-handler/https`. The CLI therefore cannot be a plugin; only the bar widget can. Symlinks anywhere inside a plugin folder are refused. The widget is its own repo, `omaego-bar`, and `install.sh --with-plugin` adds it through `omarchy plugin add`. |
+| Quickshell `Component.onCompleted` in a bar widget | Runs **before** the bar injects `settings`, so anything it starts uses defaults — a bare `omaego` instead of the configured command path. Do start-up work after the first successful probe. |
+| Reacting to focus and window changes | Do not poll. `ToplevelManager.activeToplevel` (`Quickshell.Wayland`) updates the instant focus moves, and Hyprland's `onRawEvent` reports `openwindow` / `closewindow` / `movewindow` / `activewindow` / `workspace`; coalesce bursts through a short timer. A web app's `appId` is the app's, not the ego's, so only browser windows match by `appId`. |
+| `omarchy webapp install` with no reachable icon | Exits non-zero with empty stderr and installs nothing. Internal hosts often serve no icon, so retry with a generic one. |
 
 ## Hyprland
 
 | Thing | Reality |
 |---|---|
 | `set_prop` prop names | snake_case in the Lua API: `rounding`, `border_size`, `active_border_color`, `inactive_border_color`. The classic `bordercolor`/`bordersize` spellings are rejected as "Invalid prop name", and `hyprctl setprop` is gone entirely ("unknown request"). Setting `border_size` also **reflows the tiling and resizes windows** — for an outline, change colour only. |
+| Clearing a `set_prop` colour | Only `value = 0` restores the theme's border. `'unset'` and `-1` both answer `ok` and change nothing, so a highlight "cleared" that way stays on the window for good. And colour **only** `inactive_border_color`: setting `active_border_color` too makes a focused window look like any other, which removes Hyprland's own focus marking. |
 | Many dispatches | One `hyprctl dispatch` per window per property is a process each, and it lags visibly. `hyprctl --batch "dispatch … ; dispatch …"` accepts the Lua form and runs the lot in ~6ms. |
 | Lua dispatch | `hyprctl dispatch closewindow address:0x…` **errors**. Use `hl.dsp.window.close({ window = 'address:0x…' })` and `hl.dsp.focus({ window = 'address:0x…' })`. |
 | `hyprctl clients` | Has **no `focused` key** — it is `focusHistoryID`. Compare against `hyprctl activewindow`'s address instead, or the branch never fires. |
+
+## walker
+
+| Thing | Reality |
+|---|---|
+| `--dmenu` and typed text | Rows are filtered by what is typed. When **no** row is left, Enter returns the typed text (exit 0; checked on walker 2.17). Esc returns nothing with exit 130. So one prompt can be a list and a text field — but text that still fuzzy-matches a row (typing "Mail" with "Gmail" listed) returns that row. Keep an explicit row that opens `--inputonly` for that case. Older walker returned nothing on no match. |
+| `-X` / `--selectsingle` | Picks the last remaining row **by itself** while you are still typing. Never use it on a search, where one row left is a filter result and not a choice. |
+| `--inputonly` | Shows the input and nothing else, which looks identical to a broken picker. Say in the placeholder what Enter does. |
+
+## Icons
+
+| Thing | Reality |
+|---|---|
+| Badging | Always draw the badge from `<icon>.orig.png`, the unbadged original, or a second run stacks a disc on the first. A replacement icon replaces the `.orig` too. |
+| Ring-shaped logos | A transparent centre takes on whatever is behind it and reads as a white blob in the launcher. Fill the hole, clipped to the logo's outline. |
+| Chrome's own copies | App windows use icons Chrome caches from the site manifest under `Web Applications/Manifest Resources/<id>/Icons/`. The `.desktop` icon drives the launcher only, so the two can differ. |
 
 ## Working on this in an agent shell
 

@@ -1,12 +1,98 @@
 # omaego
 
-Keep work, private and customer contexts apart in one browser — without logging
-in and out of entirely different accounts.
+**One browser identity per context, side by side on your desktop. Every link
+opens in the right one.**
 
-An **ego** is one Chrome `--user-data-dir`: its own process, window class, cookie
-jar, extensions and sync account. You run several at once. A link opens in the
-ego that owns the **workspace you are on**, and never drags you to another
-desktop to do it.
+Your employer, two customers and your private life each want their own
+Microsoft or Google login, cookies, extensions and bookmarks. Chrome profiles
+almost get you there, until a link you click outside the browser opens in
+whichever profile you touched last, and the customer's SharePoint greets you as
+the wrong person.
+
+omaego gives each context its own **ego**, a fully separate browser profile with
+its own colour, and routes every link you click to the one it belongs to. It is built
+for [Omarchy](https://omarchy.org) and Hyprland.
+
+![Two egos sharing a workspace. The omaego panel is open, and every window is outlined in its ego's colour](docs/media/hero.png)
+
+- **Links land in the right place.** A link opens in the ego that owns the
+  workspace you are on, as a tab in a window that ego already has there. It never
+  pulls you onto another desktop.
+- **Customer URLs know their owner.** `acme.sharepoint.com` belongs to Acme
+  wherever you click it. omaego asks once, then remembers.
+- **Web apps for each ego.** Outlook for Work and Outlook for Acme are two
+  launcher entries and two windows, each signed in to its own account, each
+  badged with its ego.
+- **You can see who owns what.** The bar shows which ego owns the workspace you
+  are on. Open the panel, and every window is outlined in its ego's colour.
+- **The same egos on every machine.** Keep your rules, egos and web apps in a
+  private git repo. One click syncs them, and the default agent writes the
+  commits and resolves conflicts. See [Your egos in a private
+  repo](#your-egos-in-a-private-repo).
+- **Truly separate.** Each ego is its own browser `--user-data-dir`, with its own
+  process, cookie jar, extensions and Google sync account. Logins and cookies
+  are never shared between egos.
+
+## Links that find their way
+
+Click a link outside the browser: in a terminal, an editor, a PDF. If it names an
+account (a SharePoint tenant, an Atlassian site, an Azure DevOps organisation),
+omaego asks which ego it belongs to and offers to remember the answer. Every
+other link opens in the ego of the workspace you clicked it from.
+
+![A SharePoint link: omaego asks which ego owns it, remembers the answer, and opens it as a tab in the Acme window](docs/media/route.gif)
+
+## The same app, once per ego
+
+```bash
+omaego app add work outlook teams
+omaego app add acme outlook teams slack
+```
+
+Each web app is its own window, signed in as that ego, and its launcher icon
+carries the ego's badge. Type "outlook" in the launcher, and you get every
+tenant's Outlook at once.
+
+![Outlook, Teams, Slack, Gmail and Calendar icons, each stamped with a coloured badge for its ego](docs/media/badges.png)
+
+## Everything from the bar
+
+The [bar widget](https://github.com/lcorneliussen/omaego-bar) names the egos on
+the current workspace. A pill marks the ego that owns the focused window.
+Clicking it opens a card for every ego: launch its browser or one of its web
+apps here, add an app from the catalogue or from any URL, and see the routing
+rules.
+
+![Adding Figma to the Acme ego from the panel: search the catalogue, press Enter, and it appears on the card](docs/media/add-app.gif)
+
+## Get started
+
+Everything, in one chain pinned to a reviewed commit:
+
+```bash
+git clone https://github.com/lcorneliussen/omaego && \
+  cd omaego && \
+  git checkout ef9e0643c9c47b27ef10fbb36ba45cff95a1dad0 && \
+  ./install.sh --with-plugin && \
+  omaego setup && \
+  omarchy restart shell
+```
+
+Then make your first ego and sign in:
+
+```bash
+omaego add "Acme"            # its own browser profile, colour and window class
+omaego launch acme           # sign in to Google/Microsoft in the window it opens
+```
+
+It needs Omarchy, Hyprland, and Chrome, Chromium or another Chromium-family
+browser ([details](#requires)). Packaging,
+the widget on its own, and running from a checkout are covered under
+[Install](#install).
+
+---
+
+The rest of this README is the reference.
 
 ```
 omaego list                     # the egos you have
@@ -28,6 +114,8 @@ they were clicked from.
 | **ego card** | one ego's row in the bar panel — its colour chip, name, web apps, and the actions that apply to it *on the current workspace* (`+app`, `✕`) |
 | **the mark** | the split-person icon in the bar; the label beside it names the egos on this workspace |
 | **the panel** | the popout from the mark, listing every ego card and the rules |
+| **pill** | the tint behind an ego's name in the bar when it owns the focused window |
+| **badge** | the ego-coloured disc stamped bottom right on a web app's icon |
 | **fallback ego** | the one that owns plain "Google Chrome" and web apps launched without an ego. Not an "active" ego — there is no such thing |
 
 ## Setting up an ego
@@ -67,12 +155,18 @@ omaego import google-chrome "Acme"   # copies it out; the original stays as a ro
 ## How a link is routed
 
 1. **A rule in `~/.config/omaego/rules.toml`** → that ego, forced.
-2. **A browser window of some ego already on this workspace** → reuse it,
+2. **A URL that names an account** — `acme.sharepoint.com`,
+   `acme.atlassian.net`, `dev.azure.com/acme` — belongs to an ego rather than
+   to a desktop, so omaego **asks** whose it is, then offers to remember it.
+   Enter accepts "Always open … in Acme" and writes the rule; "Just this once"
+   does not. The service list is built in; add suffixes of your own, one per
+   line, to `~/.config/omaego/account-hosts`. `OMAEGO_NO_ASK=1` turns it off.
+3. **A browser window of some ego already on this workspace** → reuse it,
    as a tab. If the workspace holds several egos, the one whose window comes
    **first in the tiling** wins — no prompt.
-3. **Otherwise** → ask, with a picker of your egos.
+4. **Otherwise** → ask, with a picker of your egos.
 
-A web-app window (Teams, Outlook, Chat) counts for step 2 as a *hint* about
+A web-app window (Teams, Outlook, Chat) counts for step 3 as a *hint* about
 which ego is here, but never receives the link: Chrome cannot put a tab in an
 `--app` window and silently opens a whole new browser window instead.
 
@@ -113,16 +207,7 @@ see `docs/gotchas.md`, which is the part worth reading before changing anything.
 
 ## Install
 
-Everything, in one chain pinned to a reviewed commit:
-
-```bash
-git clone https://github.com/lcorneliussen/omaego && \\
-  cd omaego && \\
-  git checkout ef9e0643c9c47b27ef10fbb36ba45cff95a1dad0 && \\
-  ./install.sh --with-plugin && \\
-  omaego setup && \\
-  omarchy restart shell
-```
+Everything at once is the pinned chain under [Get started](#get-started).
 
 Or packaged, which pins the released tarball by checksum:
 
@@ -165,6 +250,10 @@ omaego app add work teams outlook         # -> "Teams Work", "Outlook Work"
 omaego app add personal gmail gcal gchat
 omaego app add work --url https://jira.acme.io      # name offered: "Jira"
 omaego app add work --name "Acme Wiki"              # asks for the URL
+omaego app add work --url wiki.example.com --name Wiki --icon ./wiki.png
+omaego app probe work wiki.example.com    # name ideas and the site's icon, as JSON
+omaego app edit work "Outlook Work" --name Mail --icon ./mail.png
+omaego app remove work outlook            # by name or key; none given: pick one
 ```
 
 Each app becomes its own window, signed into that ego, with a real icon. The
@@ -205,6 +294,58 @@ swallow every other customer on the same host.
 strings and fragments are dropped — they carry tokens. Delete the file to
 forget; `OMAEGO_NO_ROUTE_LOG=1` never writes it.
 
+## Your egos in a private repo
+
+Make `~/.config/omaego` a git repo with a private remote, and every device can
+share the same egos, rules and web apps. Click **Keep your egos and rules in a
+private repo…** at the bottom of the panel, or:
+
+```bash
+omaego sync --remote git@github.com:you/myomaego.git
+```
+
+What is synced: `rules.toml`, `account-hosts`, and `egos.toml` (each ego's name
+and colour, and its web apps), plus each app's unbadged icon under `icons/`.
+
+What stays on the device: the browser data itself (logins, cookies, history),
+which browser each ego runs in (Chrome on one machine, Chromium on another),
+the fallback ego, and the remembered default browser (`engine`, git-ignored).
+
+**Each device opts in to each ego.** An ego from the repo that this device has
+not set up shows as a faded card, "in your repo, not on this device", with its
+apps and rules. **Set up here** creates it, in this device's default browser and
+with the repo's colour, and opens it so you can sign in. From then on it syncs
+like any other ego. `omaego add <name>` does the same from a terminal.
+
+Its web apps are not installed up front. They show **blurred** on its card, and
+the first click installs one, with its icon from the repo, and opens it.
+Removing a blurred app drops it from the repo.
+
+Nothing is written to the repo behind your back. The panel's **Sync** row says
+how this device and the repo differ ("2 changes here", "1 change to pull").
+Clicking it, or running `omaego sync`, does this:
+
+1. It writes this device's egos and apps into `egos.toml` and `icons/`.
+2. It fetches. If the remote is just ahead, it fast-forwards and applies.
+3. Anything that needs a commit message or a merge goes to the **default
+   omarchy agent**, in a terminal. The agent commits with a message that says
+   what changed, rebases, resolves conflicts (and asks you when both sides
+   changed the same thing), pushes, and runs `omaego apply --prune`.
+
+An app is the same app on every device when its ego and URL match. Renaming,
+re-icon-ing and removing it carry over. Removing an *ego* does not, because a
+sync never deletes browser data. After editing `egos.toml` by hand, run
+`omaego apply` before the next sync, or the sync writes the device's state back
+over your edit.
+
+```bash
+omaego sync --status [--fetch]   # drift, read-only: clean, local, behind, diverged
+omaego apply [--prune]           # make this device's egos match egos.toml
+omaego app open acme Teams       # launch, installing a declared app first
+```
+
+Syncing on a timer comes later. For now it happens when you click.
+
 ## The bar widget
 
 The label shows the ego owning the current workspace, dimmed when there is none
@@ -217,8 +358,33 @@ outlines its windows), its web apps (click to launch), the hosts that always
 open in it, and `+ Add app` / `+ Add rule`. Hover a rule to reveal its ✕. The last
 column, **New ego**, runs `omaego new`: name it in the menu, and its window
 opens so you can sign in. Rules that name no ego, such as the Zoom rewrites, are
-listed underneath. Text entry goes through the desktop menu rather than QML dialogs, so
-the picker you already know handles it and the QML stays small.
+listed underneath.
+
+`+ Add app` turns the panel into one search for that ego: the catalogue with its
+icons, filtered as you type. A pasted URL finds the catalogue app on that host.
+Apps the ego already has are listed dimmed, so you do not add a duplicate.
+Below the matches there is always a **Custom app** row, labelled by what you
+typed: **Custom app from wiki.example.com** for a URL, **Custom app “Jira”** for
+a name. Enter takes the highlighted row and nothing else. A single match is
+never added by itself.
+
+The Custom row opens one form with what you typed already filled in: URL, name
+(suggestions from the URL are one click), and the icon found at the site, shown
+before anything is installed. Paste an image URL to override it, or let the
+default omarchy agent find a better one. Enter creates. Esc steps back, and on
+the search it clears the text before it leaves. Naming an ego or a rule still
+goes through the desktop menu.
+
+Hover an app on its card for its **edit** and **remove** buttons. Remove takes
+the launcher and its icons, nothing else of the ego. Edit opens the same form
+for that app, with its URL fixed. Rename it, paste an image URL to replace its icon, or let the agent
+find a better one. The form's Remove asks once more before it removes the app.
+
+From a keybinding or the launcher, `omaego app pick <ego>` is the same search in
+the desktop menu. Enter on a row adds it, and nothing is ever picked for you.
+**Custom app…** asks for a URL or a name: a URL asks for a name next, a name
+asks for its URL. With walker as the menu, text that matches no row does the
+same on Enter. Esc adds nothing.
 
 Every ego has a colour. Names in the bar carry it, the panel shows it as a chip,
 and **while the panel is open every ego's windows are outlined in that colour** —
@@ -246,6 +412,18 @@ found, or that neither is there. Tested
 with Chrome and Chromium; Brave and Edge are wired up but untested. Chromium
 has no Google sync on Arch (`signin allowed: false`), so its egos are isolated
 islands — use Chrome if each ego should sync to its own account.
+
+## Regenerating the screenshots
+
+`scripts/readme-media.sh` rebuilds everything in `docs/media/` by driving a
+contained Omarchy desktop ([omabox](https://github.com/omacom-io/omabox)) seeded
+with the invented egos Acme, Personal and Work. Every page shown is a local
+mock under `example.com`, so a published image can never contain a real
+identity, customer or account. Rerun it after a UI change:
+
+```bash
+OMAEGO_BAR=../omaego-bar scripts/readme-media.sh
+```
 
 ## Origin
 

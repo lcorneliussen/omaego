@@ -473,8 +473,17 @@ def adoptable():
 
 
 def add_profile(name, eng=None, existing=False):
-    """A new ego: empty, or (existing=True) the browser's own profile, adopted."""
-    slug = slugify(name)
+    """A new ego: empty, or (existing=True) the browser's own profile, adopted.
+
+    A name or slug your egos repo declares sets that ego up on this device: its
+    slug, name and colour come from egos.toml, and its web apps show on its
+    card, ready to install on first use."""
+    decl = load_declared()
+    mine = next((k for k, e in decl.items()
+                 if name.strip().lower() in (k, e["name"].lower())), None)
+    if mine:
+        name = decl[mine]["name"]
+    slug = mine or slugify(name)
     d = PROFILE_ROOT / slug
     if d.exists():
         return slug
@@ -491,6 +500,8 @@ def add_profile(name, eng=None, existing=False):
         d.mkdir(parents=True)
     (d / ".profile-name").write_text(name + "\n")
     (d / ".engine").write_text(eng["id"] + "\n")
+    if mine and decl[mine].get("color"):
+        (d / ".ego-color").write_text(decl[mine]["color"] + "\n")
     ensure_native_hosts(d)
     write_desktop_entries()
     return slug
@@ -623,12 +634,13 @@ NO_MENU = ("omaego has no menu to ask with: neither Omarchy's own "
            "(omarchy-menu-select) nor walker is installed")
 
 
-def pick(options, prompt, free=False):
+def pick(options, prompt, free=False, single=True):
     """options: list of (label, value). Returns value, or None.
 
     With free=True, text that matches no row is returned as ("free", text)
-    instead of being discarded. walker filters its rows by what you type, so
-    pasting a URL hides every row - including the one offering to take a URL.
+    instead of being discarded: walker filters its rows by what you type and,
+    when none is left, hands back the typed text on Enter. Esc returns nothing.
+    single=False keeps walker from choosing a lone remaining row by itself.
     """
     if not options:
         return None
@@ -650,7 +662,8 @@ def pick(options, prompt, free=False):
             )
         else:
             r = subprocess.run(
-                ["walker", "--dmenu", "-X", "--placeholder", prompt],
+                ["walker", "--dmenu", *(["-X"] if single else []),
+                 "--placeholder", prompt],
                 input=labels, capture_output=True, text=True, timeout=120,
             )
     except Exception as e:
@@ -798,6 +811,100 @@ def match_rule(url, source_class):
             continue
         return r
     return None
+
+
+# --- account-shaped hosts ---------------------------------------------------
+
+# Services that put the account in the URL: acme.sharepoint.com belongs to
+# whoever is signed in as Acme, whatever desktop the link was clicked on. Opening
+# one in "the ego that happens to be here" lands on a sign-in page or, worse, in
+# the wrong tenant. There is no public list of these (the Public Suffix List is
+# about cookie boundaries and hosting, not tenancy), so this is ours; add your
+# own, one suffix per line, in ~/.config/omaego/account-hosts.
+ACCOUNT_HOSTS = [
+    # Microsoft
+    "sharepoint.com", "onmicrosoft.com", "dynamics.com", "visualstudio.com",
+    "powerappsportals.com",
+    # Atlassian, chat, support
+    "atlassian.net", "jira.com", "slack.com", "zulipchat.com",
+    "mattermost.cloud", "zendesk.com", "freshdesk.com", "freshservice.com",
+    "helpscout.net", "intercom.help",
+    # CRM, ERP, HR, commerce
+    "my.salesforce.com", "lightning.force.com", "my.site.com", "odoo.com",
+    "pipedrive.com", "myshopify.com", "bamboohr.com", "personio.de",
+    "personio.com", "service-now.com", "monday.com", "teamwork.com",
+    "kanbanize.com", "youtrack.cloud", "fibery.io", "qualtrics.com",
+    # Identity and cloud consoles
+    "okta.com", "oktapreview.com", "onelogin.com", "auth0.com",
+    "cloudflareaccess.com", "awsapps.com", "signin.aws.amazon.com",
+    "grafana.net", "sentry.io", "webex.com", "box.com",
+]
+# The same idea with the account as the first path segment.
+ACCOUNT_PATHS = ["dev.azure.com"]
+# A first label that names the service's own pages, not anyone's account.
+_NOT_ACCOUNTS = {"www", "app", "apps", "api", "login", "signin", "auth", "id",
+                 "accounts", "account", "admin", "status", "docs", "help",
+                 "support", "developer", "developers", "community", "my",
+                 "portal", "cloud", "go", "get", "blog", "learn", "trust"}
+ACCOUNT_FILE = Path.home() / ".config/omaego/account-hosts"
+
+
+def account_scope(url):
+    """(label, [url globs]) when the URL names an account, else None."""
+    u = urlsplit(url or "")
+    host = (u.hostname or "").lower()
+    if u.scheme not in ("http", "https") or not host:
+        return None
+    if host in ACCOUNT_PATHS:
+        seg = (u.path or "").strip("/").split("/")[0]
+        if not seg or seg.startswith("_"):
+            return None
+        return f"{host}/{seg}", [f"https://{host}/{seg}", f"https://{host}/{seg}/*"]
+    suffixes = list(ACCOUNT_HOSTS)
+    try:
+        suffixes += [l.strip().lower().lstrip("*.") for l in
+                     ACCOUNT_FILE.read_text().splitlines()
+                     if l.strip() and not l.lstrip().startswith("#")]
+    except OSError:
+        pass
+    for suf in suffixes:
+        if not host.endswith("." + suf):
+            continue
+        account = host[:-len(suf) - 1].split(".")[0]
+        if account in _NOT_ACCOUNTS:
+            return None
+        if suf == "sharepoint.com":
+            # One tenant, three hosts: acme, acme-my (OneDrive), acme-admin.
+            account = re.sub(r"-(my|admin)$", "", account)
+            return (f"{account}.{suf}",
+                    [f"https://{account}.{suf}/*", f"https://{account}-my.{suf}/*"])
+        return host, [f"https://{host}/*"]
+    return None
+
+
+def add_rule(pattern, ego_name):
+    RULES.parent.mkdir(parents=True, exist_ok=True)
+    with RULES.open("a") as f:
+        f.write(f'\n[[rule]]\nurl = "{pattern}"\nprofile = "{ego_name}"\n')
+
+
+def ask_account(label, patterns, by_class, here):
+    """Ask whose account this is, and whether to remember it. Returns a target."""
+    chosen = pick(ego_options(by_class, first={cls for _, cls, _ in here}),
+                  f"{label} is one account — open it in…")
+    target = resolve_choice(chosen) if chosen is not None else None
+    if target is None:
+        return None
+    # walker has no checkbox, so "ticked by default" is the first row: Enter
+    # saves. Esc here still opens the link - the ego was already chosen.
+    keep = pick([(f"Always open {label} in {target['name']}", True),
+                 ("Just this once", False)],
+                f"Remember {label} for {target['name']}?")
+    if keep:
+        for pat in patterns:
+            add_rule(pat, target["name"])
+        notify(f"{label} now always opens in {target['name']}")
+    return target
 
 
 # --- launching --------------------------------------------------------------
@@ -1062,7 +1169,19 @@ def open_url(url=None, incognito=False):
         if target is None:
             notify(f"rule points at unknown profile {wanted!r}")
 
-    # 2. Otherwise prefer a browser already on this desktop.
+    # 2. A URL that names an account belongs to an ego, not to a desktop, and
+    # no rule says which yet: ask, rather than guess from what is here.
+    scope = None
+    if (target is None and not wanted and routing_url and not incognito
+            and len(by_class) > 1 and os.environ.get("OMAEGO_NO_ASK") != "1"):
+        scope = account_scope(routing_url)
+    if scope:
+        target = ask_account(*scope, by_class, here)
+        if target is None:
+            return
+        why = "picked"
+
+    # 3. Otherwise prefer a browser already on this desktop.
     if target is None and here:
         focused = [cls for _, cls, foc in here if foc]
         distinct = {cls for _, cls, _ in here}
@@ -1079,7 +1198,7 @@ def open_url(url=None, incognito=False):
             target = by_class[next(cls for _, cls, _ in here)]
             why = why or "workspace"
 
-    # 3. Nothing here: ask which ego to start on this desktop.
+    # 4. Nothing here: ask which ego to start on this desktop.
     if target is None and by_class and (len(by_class) == 1 or not picker()):
         # One place it could go, or no menu to ask with: open it rather than
         # drop it. The fallback ego if there is one, else the first there is.
@@ -1212,28 +1331,78 @@ APP_NAME_TEMPLATE = os.environ.get("OMAEGO_APP_NAME", "{app} {ego}")
 
 _G = "https://www.gstatic.com/images/branding/product/2x/{}_2020q4_512dp.png"
 
+# Catalogue icons come from the dashboard-icons set: square, transparent PNGs
+# at 512px, which a site's own favicon rarely is.
+_D = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/{}.png"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omaego"
+
 # key: (display name, url, rule domain or None, icon url or None)
 # A rule domain is only suggested where one ego plausibly owns the whole host.
 WEBAPPS = {
-    "teams":    ("Teams",     "https://teams.microsoft.com/",     None,                  None),
-    "outlook":  ("Outlook",   "https://outlook.office.com/mail/", None,                  None),
-    "office":   ("Office",    "https://www.office.com/",          None,                  None),
-    "gmail":    ("Gmail",     "https://mail.google.com/",         None,  _G.format("gmail")),
-    "gcal":     ("Calendar",  "https://calendar.google.com/",     None,  _G.format("calendar")),
-    "gchat":    ("Chat",      "https://chat.google.com/",         None,  _G.format("chat")),
-    "gdrive":   ("Drive",     "https://drive.google.com/",        None,  _G.format("drive")),
-    "gdocs":    ("Docs",      "https://docs.google.com/",         None,  _G.format("docs")),
-    "meet":     ("Meet",      "https://meet.google.com/",         None,  _G.format("meet")),
-    "keep":     ("Keep",      "https://keep.google.com/",         None,  _G.format("keep")),
-    "slack":    ("Slack",     "https://app.slack.com/client",     None,                  None),
-    "zoom":     ("Zoom",      "https://app.zoom.us/wc/home",      None,                  None),
-    "whatsapp": ("WhatsApp",  "https://web.whatsapp.com/",        "web.whatsapp.com",    None),
-    "github":   ("GitHub",    "https://github.com/",              None,                  None),
-    "linear":   ("Linear",    "https://linear.app/",              "linear.app",          None),
-    "notion":   ("Notion",    "https://www.notion.so/",           "notion.so",           None),
-    "figma":    ("Figma",     "https://www.figma.com/files",      "figma.com",           None),
-    "chatgpt":  ("ChatGPT",   "https://chatgpt.com/",             "chatgpt.com",         None),
-    "claude":   ("Claude",    "https://claude.ai/",               "claude.ai",           None),
+    "teams":      ("Teams",         "https://teams.microsoft.com/",      None, _D.format("microsoft-teams")),
+    "outlook":    ("Outlook",       "https://outlook.office.com/mail/",  None, _D.format("microsoft-outlook")),
+    "office":     ("Office",        "https://www.office.com/",           None, _D.format("microsoft-365")),
+    "onedrive":   ("OneDrive",      "https://onedrive.live.com/",        None, _D.format("microsoft-onedrive")),
+    "onenote":    ("OneNote",       "https://www.onenote.com/notebooks", None, _D.format("microsoft-onenote")),
+    "todo":       ("To Do",         "https://to-do.office.com/tasks/",   None, _D.format("microsoft-to-do")),
+    "azure":      ("Azure",         "https://portal.azure.com/",         None, _D.format("azure")),
+    "devops":     ("Azure DevOps",  "https://dev.azure.com/",            None, _D.format("azure-devops")),
+    "gmail":      ("Gmail",         "https://mail.google.com/",          None, _G.format("gmail")),
+    "gcal":       ("Calendar",      "https://calendar.google.com/",      None, _G.format("calendar")),
+    "gchat":      ("Chat",          "https://chat.google.com/",          None, _G.format("chat")),
+    "gdrive":     ("Drive",         "https://drive.google.com/",         None, _G.format("drive")),
+    "gdocs":      ("Docs",          "https://docs.google.com/",          None, _G.format("docs")),
+    "gsheets":    ("Sheets",        "https://sheets.google.com/",        None, _D.format("google-sheets")),
+    "gslides":    ("Slides",        "https://slides.google.com/",        None, _D.format("google-slides")),
+    "meet":       ("Meet",          "https://meet.google.com/",          None, _G.format("meet")),
+    "keep":       ("Keep",          "https://keep.google.com/",          None, _G.format("keep")),
+    "gmaps":      ("Maps",          "https://www.google.com/maps",       None, _D.format("google-maps")),
+    "gphotos":    ("Photos",        "https://photos.google.com/",        None, _D.format("google-photos")),
+    "gtranslate": ("Translate",     "https://translate.google.com/",     None, _D.format("google-translate")),
+    "gemini":     ("Gemini",        "https://gemini.google.com/",        None, _D.format("google-gemini")),
+    "youtube":    ("YouTube",       "https://www.youtube.com/",          None, _D.format("youtube")),
+    "ytmusic":    ("YouTube Music", "https://music.youtube.com/",        None, _D.format("youtube-music")),
+    "slack":      ("Slack",         "https://app.slack.com/client",      None, _D.format("slack")),
+    "discord":    ("Discord",       "https://discord.com/channels/@me",  None, _D.format("discord")),
+    "zoom":       ("Zoom",          "https://app.zoom.us/wc/home",       None, _D.format("zoom")),
+    "whatsapp":   ("WhatsApp",      "https://web.whatsapp.com/",         "web.whatsapp.com", _D.format("whatsapp")),
+    "telegram":   ("Telegram",      "https://web.telegram.org/",         "web.telegram.org", _D.format("telegram")),
+    "github":     ("GitHub",        "https://github.com/",               None, _D.format("github")),
+    "gitlab":     ("GitLab",        "https://gitlab.com/",               None, _D.format("gitlab")),
+    "bitbucket":  ("Bitbucket",     "https://bitbucket.org/",            None, _D.format("bitbucket")),
+    "vercel":     ("Vercel",        "https://vercel.com/dashboard",      None, _D.format("vercel")),
+    "cloudflare": ("Cloudflare",    "https://dash.cloudflare.com/",      None, _D.format("cloudflare")),
+    "aws":        ("AWS",           "https://console.aws.amazon.com/",   None, _D.format("aws")),
+    "sentry":     ("Sentry",        "https://sentry.io/",                None, _D.format("sentry")),
+    "linear":     ("Linear",        "https://linear.app/",               "linear.app", _D.format("linear")),
+    "notion":     ("Notion",        "https://www.notion.so/",            "notion.so", _D.format("notion")),
+    "figma":      ("Figma",         "https://www.figma.com/files",       "figma.com", _D.format("figma")),
+    "miro":       ("Miro",          "https://miro.com/app/dashboard/",   "miro.com", _D.format("miro")),
+    "asana":      ("Asana",         "https://app.asana.com/",            "app.asana.com", _D.format("asana")),
+    "clickup":    ("ClickUp",       "https://app.clickup.com/",          "app.clickup.com", _D.format("clickup")),
+    "airtable":   ("Airtable",      "https://airtable.com/",             "airtable.com", _D.format("airtable")),
+    "todoist":    ("Todoist",       "https://app.todoist.com/",          "todoist.com", _D.format("todoist")),
+    "basecamp":   ("Basecamp",      "https://launchpad.37signals.com/",  None, _D.format("basecamp")),
+    "excalidraw": ("Excalidraw",    "https://excalidraw.com/",           None, _D.format("excalidraw")),
+    "drawio":     ("draw.io",       "https://app.diagrams.net/",         None, _D.format("draw-io")),
+    "chatgpt":    ("ChatGPT",       "https://chatgpt.com/",              "chatgpt.com", _D.format("chatgpt")),
+    "claude":     ("Claude",        "https://claude.ai/",                "claude.ai", _D.format("claude-ai")),
+    "perplexity": ("Perplexity",    "https://www.perplexity.ai/",        "perplexity.ai", _D.format("perplexity")),
+    "mistral":    ("Le Chat",       "https://chat.mistral.ai/",          "chat.mistral.ai", _D.format("mistral-ai")),
+    "deepl":      ("DeepL",         "https://www.deepl.com/translator",  None, _D.format("deepl")),
+    "proton":     ("Proton Mail",   "https://mail.proton.me/",           None, _D.format("proton-mail")),
+    "protoncal":  ("Proton Calendar", "https://calendar.proton.me/",     None, _D.format("proton-calendar")),
+    "fastmail":   ("Fastmail",      "https://app.fastmail.com/",         None, _D.format("fastmail")),
+    "linkedin":   ("LinkedIn",      "https://www.linkedin.com/",         None, _D.format("linkedin")),
+    "x":          ("X",             "https://x.com/",                    None, _D.format("x")),
+    "bluesky":    ("Bluesky",       "https://bsky.app/",                 None, _D.format("bluesky")),
+    "reddit":     ("Reddit",        "https://www.reddit.com/",           None, _D.format("reddit")),
+    "spotify":    ("Spotify",       "https://open.spotify.com/",         None, _D.format("spotify")),
+    "tidal":      ("Tidal",         "https://listen.tidal.com/",         None, _D.format("tidal")),
+    "netflix":    ("Netflix",       "https://www.netflix.com/",          None, _D.format("netflix")),
+    "dropbox":    ("Dropbox",       "https://www.dropbox.com/home",      None, _D.format("dropbox")),
+    "stripe":     ("Stripe",        "https://dashboard.stripe.com/",     None, _D.format("stripe")),
+    "paypal":     ("PayPal",        "https://www.paypal.com/myaccount/", None, _D.format("paypal")),
 }
 
 
@@ -1346,6 +1515,131 @@ def fetch_icon(url, dest):
         return False
 
 
+def is_image(path):
+    kind = subprocess.run(["file", "-b", "--mime-type", str(path)],
+                          capture_output=True, text=True).stdout
+    return kind.startswith("image/")
+
+
+def obtain_icon(src, dest):
+    """Put an image named by URL or by local path at dest, as a 256px PNG."""
+    src = (src or "").strip()
+    if not src:
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    local = Path(src[7:] if src.startswith("file://") else src).expanduser()
+    if local.is_file():
+        if local != dest:
+            shutil.copy(local, dest)
+    elif not fetch_icon(normalize_url(src), dest):
+        return False
+    if is_image(dest) and normalize_icon(dest):
+        return True
+    dest.unlink(missing_ok=True)
+    return False
+
+
+def site_icon(url, dest):
+    """The site's own icon, best first: apple-touch-icon, then the favicon
+    service. Same order as omarchy's fetcher, done here so the result can be
+    shown before anything is installed."""
+    u = urlsplit(url)
+    if not u.hostname:
+        return False
+    origin = f"{u.scheme}://{u.netloc}"
+    tries = []
+    try:
+        page = subprocess.run(["curl", "-fsSL", "--max-time", "5", url],
+                              capture_output=True, timeout=8).stdout[:200000]
+        page = page.decode("utf-8", "replace")
+        for tag in re.findall(r"<link\b[^>]*>", page, re.I):
+            if not re.search(r"rel=[\"'][^\"']*apple-touch-icon", tag, re.I):
+                continue
+            href = re.search(r"href=[\"']([^\"']+)", tag, re.I)
+            if href:
+                h = href.group(1)
+                tries.append(h if re.match(r"https?://", h) else
+                             "https:" + h if h.startswith("//") else
+                             origin + h if h.startswith("/") else
+                             origin + "/" + h)
+                break
+    except Exception:
+        pass
+    tries += [origin + "/apple-touch-icon.png",
+              f"https://www.google.com/s2/favicons?domain={origin}&sz=256"]
+    for t in tries:
+        if obtain_icon(t, dest):
+            # The favicon service answers an unknown host with a 16px globe,
+            # which is worse than saying nothing was found.
+            w = subprocess.run(["magick", "identify", "-format", "%w", str(dest)],
+                               capture_output=True, text=True).stdout.strip()
+            if t.startswith("https://www.google.com/s2/") and w.isdigit() and int(w) < 32:
+                dest.unlink(missing_ok=True)
+                return False
+            return True
+    return False
+
+
+def catalog_icon(key):
+    return CACHE / "catalog" / f"{key}.png"
+
+
+def looks_like_url(text):
+    t = (text or "").strip()
+    return bool(t) and not re.search(r"\s", t) and (
+        "://" in t or re.match(r"^[^./]+(\.[^./]+)+", t) is not None)
+
+
+def catalog_match(text):
+    """The catalogue key that typed text names: by name or key, or for a URL by
+    its host. A pasted outlook.office.com/mail is Outlook, not a custom app."""
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    if looks_like_url(t):
+        host = (urlsplit(normalize_url(t)).hostname or "").removeprefix("www.")
+        return next((k for k, v in WEBAPPS.items()
+                     if (urlsplit(v[1]).hostname or "").removeprefix("www.") == host),
+                    None)
+    return next((k for k, v in WEBAPPS.items() if t in (k, v[0].lower())), None)
+
+
+def catalog_fetch():
+    """Download every catalogue icon that is not cached yet. Returns how many."""
+    from concurrent.futures import ThreadPoolExecutor
+    todo = [(k, v[3]) for k, v in WEBAPPS.items()
+            if v[3] and not catalog_icon(k).exists()]
+    with ThreadPoolExecutor(8) as ex:
+        return sum(ex.map(lambda kv: obtain_icon(kv[1], catalog_icon(kv[0])), todo))
+
+
+def app_probe(url, ego_name=None, icon=None, names_only=False):
+    """What the create form shows for a URL: name candidates and an icon.
+
+    names_only skips the network, so names can be offered at once while the
+    icon - up to three fetches against a host that may not answer - follows.
+    """
+    url = normalize_url((url or "").strip())
+    host = urlsplit(url).hostname if url else None
+    out = {"url": url or "", "host": host or "", "names": [], "iconPath": ""}
+    if not host or "." not in host or re.search(r"\s", url):
+        return out
+    out["names"] = name_candidates(url, ego_name)
+    if names_only:
+        return out
+    key = next((k for k, v in WEBAPPS.items() if v[1].rstrip("/") == url.rstrip("/")), None)
+    if key and not icon:
+        dest = catalog_icon(key)
+        if dest.exists() or obtain_icon(WEBAPPS[key][3], dest):
+            out["iconPath"] = str(dest)
+        return out
+    import hashlib
+    dest = CACHE / "probe" / (hashlib.sha1((icon or url).encode()).hexdigest()[:16] + ".png")
+    if dest.exists() or (obtain_icon(icon, dest) if icon else site_icon(url, dest)):
+        out["iconPath"] = str(dest)
+    return out
+
+
 def app_rule_conflict(domain):
     """Which ego, if any, already claims this domain in rules.toml."""
     if not domain:
@@ -1358,6 +1652,7 @@ def app_rule_conflict(domain):
 
 
 def append_rule(domain, ego_name):
+    RULES.parent.mkdir(parents=True, exist_ok=True)
     with RULES.open("a") as f:
         f.write(f'\n[[rule]]\nurl = "https://*{domain}/*"\nprofile = "{ego_name}"\n')
 
@@ -1409,6 +1704,376 @@ def normalize_url(url):
     return url
 
 
+def find_app(slug, want):
+    """An installed app of this ego by its launcher name ("Outlook Acme"), its
+    name without the ego ("Outlook"), or its catalogue key ("outlook")."""
+    apps = installed_apps().get(slug, [])
+    ego = profiles().get(slug, {}).get("name", "")
+    w = (want or "").strip().lower()
+    def short(n):
+        return re.sub(rf"\s*\b{re.escape(ego)}\b\s*", " ", n, flags=re.I).strip().lower()
+    return (next((a for a in apps if a["name"].lower() == w), None)
+            or next((a for a in apps if short(a["name"]) == w), None)
+            or next((a for a in apps if a["key"] == w), None))
+
+
+def remove_app(app):
+    """Delete an installed web app: its launcher and both icon files.
+
+    Not `omarchy webapp remove`: it indexes launchers by omarchy's own Exec
+    line, which ours do not have, and it leaves the unbadged .orig behind."""
+    (DESKTOP_DIR / app["desktop"]).unlink(missing_ok=True)
+    icon = app["icon"]
+    if icon and "/" not in icon:
+        for suffix in (".png", ".orig.png"):
+            (ICON_DIR / f"{icon}{suffix}").unlink(missing_ok=True)
+    subprocess.run(["update-desktop-database", str(DESKTOP_DIR)], capture_output=True)
+    subprocess.run(["gtk-update-icon-cache",
+                    str(Path.home() / ".local/share/icons/hicolor")],
+                   capture_output=True)
+
+
+def rename_app(app, new_name):
+    """Rename an installed web app: its launcher, and its icon files with it."""
+    old_desktop = DESKTOP_DIR / app["desktop"]
+    old_slug = app["icon"] if app["icon"] and "/" not in app["icon"] else None
+    new_slug = re.sub(r"[^a-z0-9]+", "-", new_name.lower()).strip("-")
+    txt = old_desktop.read_text()
+    txt = re.sub(r"^Name=.*$", f"Name={new_name}", txt, flags=re.M)
+    if old_slug:
+        for suffix in (".png", ".orig.png"):
+            src = ICON_DIR / f"{old_slug}{suffix}"
+            if src.exists():
+                src.rename(ICON_DIR / f"{new_slug}{suffix}")
+        txt = re.sub(r"^Icon=.*$", f"Icon={new_slug}", txt, flags=re.M)
+    (DESKTOP_DIR / f"{new_name}.desktop").write_text(txt)
+    if old_desktop.name != f"{new_name}.desktop":
+        old_desktop.unlink(missing_ok=True)
+    print(f"  {app['name']}  ->  {new_name}")
+
+
+def set_app_icon(slug, app, src):
+    """Replace an installed web app's icon with an image URL or file, badged."""
+    icon_slug = re.sub(r"[^a-z0-9]+", "-", app["name"].lower()).strip("-")
+    ICON_DIR.mkdir(parents=True, exist_ok=True)
+    dest = ICON_DIR / f"{icon_slug}.png"
+    ok = (Path(src).exists() and shutil.copy(src, dest)) or fetch_icon(src, dest)
+    if not (ok and normalize_icon(dest)):
+        print(f"could not use {src}", file=sys.stderr)
+        notify(f"could not use that image for {app['name']}")
+        return False
+    (ICON_DIR / f"{icon_slug}.orig.png").unlink(missing_ok=True)
+    apply_badge(icon_slug, profiles()[slug])
+    d = DESKTOP_DIR / app["desktop"]
+    d.write_text(re.sub(r"^Icon=.*$", f"Icon={icon_slug}", d.read_text(),
+                        flags=re.M))
+    subprocess.run(["gtk-update-icon-cache",
+                    str(Path.home() / ".local/share/icons/hicolor")],
+                   capture_output=True)
+    subprocess.run(["update-desktop-database", str(DESKTOP_DIR)],
+                   capture_output=True)
+    print(f"  {app['name']}: icon set from {src}")
+    return True
+
+
+# --- the egos repo -----------------------------------------------------------
+# ~/.config/omaego is meant to be a private git repo: rules.toml, account-hosts,
+# and egos.toml - every ego, its colour and its web apps - with each app's
+# unbadged icon under icons/. The browser's own data (logins, cookies, history)
+# never goes in it, and neither does what belongs to one device: which browser
+# an ego runs in, the fallback ego, the remembered default browser (`engine`,
+# git-ignored).
+#
+# A device opts in to each ego. An ego the repo declares that this device has
+# not set up is offered on the panel; setting it up (`omaego add <name>`)
+# creates it from egos.toml, and from then on it syncs like any other.
+#
+# Nothing is written there behind your back. `omaego sync --status` compares
+# the repo with this machine read-only, for the panel's sync icon; `omaego
+# sync` writes this machine's state, pulls, and hands anything that needs a
+# commit message or a merge to the default agent.
+
+CONFIG_DIR = Path.home() / ".config/omaego"
+EGOS_FILE = CONFIG_DIR / "egos.toml"
+
+
+def short_name(name, ego_name):
+    """ "Outlook Work" -> "Outlook": the launcher name without its ego."""
+    return re.sub(rf"\s*\b{re.escape(ego_name)}\b\s*", " ", name,
+                  flags=re.I).strip() or name
+
+
+def load_declared():
+    """egos.toml as slug -> {name, color, fallback, apps}. Empty when absent."""
+    try:
+        data = tomllib.loads(EGOS_FILE.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log(f"egos.toml: {e}")
+        notify(f"egos.toml: {e}")
+        return {}
+    out = {}
+    for e in data.get("ego", []):
+        if e.get("slug"):
+            out[e["slug"]] = {
+                "name": e.get("name") or e["slug"].title(),
+                "color": (e.get("color") or "").lstrip("#") or None,
+                "apps": [a for a in e.get("app", []) if a.get("url") and a.get("name")],
+            }
+    return out
+
+
+def local_icon(app):
+    """The unbadged original of an installed app's icon, if it has one."""
+    icon = app.get("icon") or ""
+    if not icon or "/" in icon:
+        return None
+    for f in (ICON_DIR / f"{icon}.orig.png", ICON_DIR / f"{icon}.png"):
+        if f.exists():
+            return f
+    return None
+
+
+def repo_state():
+    """What egos.toml should say: every ego and installed app on this machine,
+    plus whatever the file declares that this machine has not installed yet.
+
+    An app is the same app on every machine when its ego and URL match, so a
+    rename here is a rename, not a second entry. Declared apps are kept until
+    removed on purpose - removing an app edits egos.toml itself - so a machine
+    that never opened one does not delete it for everyone.
+    """
+    decl, egos, inst = load_declared(), profiles(), installed_apps()
+    state, icons = {}, {}
+    for slug in sorted(set(egos) | set(decl)):
+        d = decl.get(slug, {})
+        here = slug in egos
+        name = egos[slug]["name"] if here else d["name"]
+        apps = {}
+        for a in inst.get(slug, []) if here else []:
+            entry = {"name": short_name(a["name"], name), "url": a["url"]}
+            if a.get("key"):
+                entry["key"] = a["key"]
+            src = local_icon(a)
+            if src:
+                entry["icon"] = f"icons/{a['icon']}.png"
+                icons[entry["icon"]] = src
+            apps[a["url"]] = entry
+        for a in d.get("apps", []):
+            if a["url"] not in apps:
+                apps[a["url"]] = {k: a[k] for k in ("name", "url", "key", "icon") if a.get(k)}
+        state[slug] = {
+            "name": name,
+            "color": ego_color(slug) if here else d.get("color"),
+            "apps": sorted(apps.values(), key=lambda x: x["name"].lower()),
+        }
+    return state, icons
+
+
+def render_egos(state):
+    q = lambda v: json.dumps(v, ensure_ascii=False)   # a JSON string is a TOML one
+    out = ["# Every omaego ego and its web apps. Logins and cookies are not in here.",
+           "# `omaego sync` writes it from this machine; after editing it by hand,",
+           "# run `omaego apply` first, or the next sync writes your edit back.", ""]
+    for slug, e in state.items():
+        out += ["[[ego]]", f"slug = {q(slug)}", f"name = {q(e['name'])}"]
+        if e.get("color"):
+            out.append(f"color = {q(e['color'])}")
+        out.append("")
+        for a in e["apps"]:
+            out.append("[[ego.app]]")
+            out += [f"{k} = {q(a[k])}" for k in ("name", "url", "key", "icon") if a.get(k)]
+            out.append("")
+    return "\n".join(out)
+
+
+def export_repo(write=True):
+    """Bring egos.toml and icons/ up to this machine's state. Returns the
+    paths that differ (and, with write, were rewritten)."""
+    import filecmp
+    state, icons = repo_state()
+    text = render_egos(state)
+    changed = []
+    try:
+        old = EGOS_FILE.read_text()
+    except FileNotFoundError:
+        old = None
+    if old != text:
+        changed.append("egos.toml")
+        if write:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            EGOS_FILE.write_text(text)
+    for rel, src in icons.items():
+        dest = CONFIG_DIR / rel
+        if not dest.exists() or not filecmp.cmp(src, dest, shallow=False):
+            changed.append(rel)
+            if write:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(src, dest)
+    keep = set(icons) | {a["icon"] for e in state.values() for a in e["apps"] if a.get("icon")}
+    for f in sorted((CONFIG_DIR / "icons").glob("*.png")):
+        rel = f"icons/{f.name}"
+        if rel not in keep:
+            changed.append(rel)
+            if write:
+                f.unlink()
+    return changed
+
+
+def forget_declared(slug, url):
+    """Drop one app from egos.toml: removing an app is a decision to sync."""
+    decl = load_declared()
+    if slug not in decl:
+        return
+    apps = decl[slug]["apps"]
+    keep = [a for a in apps if a["url"] != url]
+    if len(keep) != len(apps):
+        decl[slug]["apps"] = keep
+        EGOS_FILE.write_text(render_egos(decl))
+        for a in apps:
+            if a["url"] == url and a.get("icon"):
+                (CONFIG_DIR / a["icon"]).unlink(missing_ok=True)
+
+
+def icon_from_repo(icon_slug, repo_rel, ego):
+    """Install a repo icon byte for byte as the original, then badge it - so
+    the next export finds nothing changed."""
+    src = CONFIG_DIR / repo_rel
+    if not src.is_file():
+        return False
+    ICON_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy(src, ICON_DIR / f"{icon_slug}.orig.png")
+    return apply_badge(icon_slug, ego)
+
+
+def pending_apps(slug):
+    """Apps egos.toml declares for an ego that are not installed here yet."""
+    have = {a["url"] for a in installed_apps().get(slug, [])}
+    return [a for a in load_declared().get(slug, {}).get("apps", [])
+            if a["url"] not in have]
+
+
+def install_declared(slug, decl_app):
+    """Install one declared app as egos.toml describes it. Returns the app."""
+    ego = profiles()[slug]
+    icon = str(CONFIG_DIR / decl_app["icon"]) if decl_app.get("icon") else None
+    if decl_app.get("key") and decl_app["key"] in WEBAPPS and not icon:
+        app_add(slug, [decl_app["key"]])
+    else:
+        app_add(slug, [], url=decl_app["url"], display=decl_app["name"], icon=icon)
+    app = next((a for a in installed_apps().get(slug, [])
+                if a["url"] == decl_app["url"]), None)
+    if app and decl_app.get("icon") and app.get("icon") and "/" not in app["icon"]:
+        icon_from_repo(app["icon"], decl_app["icon"], ego)
+        subprocess.run(["gtk-update-icon-cache",
+                        str(Path.home() / ".local/share/icons/hicolor")],
+                       capture_output=True)
+    return app
+
+
+def apply_repo(prune=False):
+    """Make this device's egos match egos.toml: names and colours, and their
+    installed apps renamed and re-iconed. Only egos set up here: one the repo
+    adds is offered on the panel, never created behind your back. Declared apps
+    that are not installed stay that way - the first click installs. With
+    prune, installed apps egos.toml no longer lists are removed (removed on
+    another device). An ego is never deleted: its browser data is not something
+    a sync should throw away."""
+    import filecmp
+    decl = load_declared()
+    if not decl:
+        return []
+    done = []
+    for slug, e in decl.items():
+        d = EGO_ROOT / slug
+        if not d.exists():
+            continue
+        nf = d / ".profile-name"
+        if not nf.exists() or nf.read_text().strip() != e["name"]:
+            nf.write_text(e["name"] + "\n")
+            done.append(f"renamed ego {e['name']}")
+        if e.get("color") and ego_color(slug) != e["color"]:
+            (d / ".ego-color").write_text(e["color"] + "\n")
+    egos = profiles()
+    for slug, apps in installed_apps().items():
+        if slug not in decl or slug not in egos:
+            continue
+        by_url = {a["url"]: a for a in decl[slug]["apps"]}
+        for a in apps:
+            want = by_url.get(a["url"])
+            if want is None:
+                if prune:
+                    remove_app(a)
+                    done.append(f"removed {a['name']}")
+                continue
+            full = APP_NAME_TEMPLATE.format(app=want["name"], ego=egos[slug]["name"])
+            if a["name"] != full:
+                rename_app(a, full)
+                a = next(x for x in installed_apps()[slug] if x["url"] == a["url"])
+                done.append(f"renamed {full}")
+            src = CONFIG_DIR / want["icon"] if want.get("icon") else None
+            cur = local_icon(a)
+            if src and src.is_file() and a.get("icon") and "/" not in a["icon"] \
+                    and not (cur and filecmp.cmp(src, cur, shallow=False)):
+                icon_from_repo(a["icon"], want["icon"], egos[slug])
+                done.append(f"new icon for {a['name']}")
+    subprocess.run(["update-desktop-database", str(DESKTOP_DIR)], capture_output=True)
+    subprocess.run(["gtk-update-icon-cache",
+                    str(Path.home() / ".local/share/icons/hicolor")],
+                   capture_output=True)
+    return done
+
+
+def available_egos():
+    """Egos the repo declares that this device has not set up."""
+    here = profiles()
+    return {k: e for k, e in load_declared().items() if k not in here}
+
+
+GITIGNORE = "# per device, never synced\nengine\n"
+
+
+def ensure_gitignore():
+    f = CONFIG_DIR / ".gitignore"
+    have = f.read_text() if f.exists() else ""
+    if not re.search(r"(?m)^/?engine$", have):
+        f.write_text(have + ("" if not have or have.endswith("\n") else "\n") + GITIGNORE)
+
+
+def git(*args, timeout=20):
+    try:
+        return subprocess.run(["git", "-C", str(CONFIG_DIR), *args],
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", "timed out")
+
+
+def sync_status(fetch=False):
+    """Where the repo stands against this machine and its remote. Read-only;
+    `behind` is as of the last fetch unless fetch is set."""
+    if not (CONFIG_DIR / ".git").exists():
+        return {"state": "norepo", "local": 0, "ahead": 0, "behind": 0}
+    remote = (git("remote").stdout.split() or [None])[0]
+    if fetch and remote:
+        git("fetch", "--quiet", remote, timeout=30)
+    pending = set(export_repo(write=False))
+    pending |= {l[3:].strip('"') for l in git("status", "--porcelain").stdout.splitlines() if l.strip()}
+    ahead = behind = 0
+    upstream = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    if upstream.returncode == 0:
+        counts = git("rev-list", "--left-right", "--count", "HEAD...@{u}").stdout.split()
+        if len(counts) == 2:
+            ahead, behind = int(counts[0]), int(counts[1])
+    local = bool(pending) or ahead > 0
+    state = ("diverged" if local and behind else "local" if local
+             else "behind" if behind
+             else "unpublished" if remote and upstream.returncode != 0 else "clean")
+    return {"state": state, "local": len(pending), "ahead": ahead, "behind": behind,
+            "remote": remote, "upstream": upstream.stdout.strip() or None,
+            "changes": sorted(pending)}
+
+
 def agent_find_icon(slug, name, app_url):
     """Hand the icon hunt to the default omarchy agent.
 
@@ -1426,6 +2091,11 @@ def agent_find_icon(slug, name, app_url):
         f"That command downloads, normalises and rewrites the .desktop entry, so "
         f"nothing else needs editing. Verify afterwards with:\n"
         f"    omaego app installed | grep -i \"{name}\"")
+    return run_agent(prompt)
+
+
+def run_agent(prompt, cwd=None):
+    """Hand a prompt to the default omarchy agent, in its own terminal."""
     # omarchy only prints a hint when no default agent is configured, and a
     # Popen succeeds either way - so check before claiming the handoff worked.
     if not (Path.home() / ".config/omarchy/defaults/agent").exists():
@@ -1435,14 +2105,14 @@ def agent_find_icon(slug, name, app_url):
         return False
     try:
         subprocess.Popen(["omarchy", "agent", "prompt", prompt],
-                         start_new_session=True)
+                         start_new_session=True, cwd=cwd)
         return True
     except Exception:
         return False
 
 
 def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
-            interactive=False):
+            interactive=False, icon=None, agent_icon=False):
     # Resolve the ego FIRST: naming a web app needs it, both to exclude the
     # ego's own name from the candidates and to build the launcher name.
     egos = profiles()
@@ -1456,14 +2126,17 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
         u = normalize_url(url)
         cands = name_candidates(u, ego["name"])
         # Suggestions are rows you can pick; nothing is accepted on your behalf.
-        # A picker cannot also take free text - walker filters its rows against
-        # what is typed and returns nothing when none match - so typing another
-        # name is itself a row, which opens an input box.
+        # A name that matches no row is taken as typed. One that partly matches
+        # a suggestion would pick that suggestion instead, so typing another
+        # name is also a row of its own, which opens a plain input box.
         choice = pick([(c, c) for c in cands] + [("Type another name…", "__type__")],
-                      f"Name this app ({urlsplit(u).hostname})")
+                      f"Name this app ({urlsplit(u).hostname})",
+                      free=True, single=False)
         if choice is None:
             return 1
-        if choice == "__type__":
+        if isinstance(choice, tuple):
+            display = choice[1]
+        elif choice == "__type__":
             display = (prompt_text(f"Name for {urlsplit(u).hostname}") or "").strip()
             if not display:
                 notify("cancelled: a name is needed")
@@ -1483,7 +2156,7 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
 
     items = []
     if url:
-        items.append((display or urlsplit(url).hostname or "App", url, None, None))
+        items.append((display or urlsplit(url).hostname or "App", url, None, icon))
     for k in keys:
         if k not in WEBAPPS:
             print(f"unknown app {k!r} (see: omaego app list)", file=sys.stderr)
@@ -1504,7 +2177,7 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
         icon_arg = ""
         if icon_url:
             dest = ICON_DIR / f"{icon_slug}.png"
-            if fetch_icon(icon_url, dest) and normalize_icon(dest):
+            if obtain_icon(icon_url, dest):
                 icon_arg = icon_slug          # a bare name is used as-is
         exec_line = f"{bin_webapp} --ego={slug} --app={app_url}"
         def run_install(icon):
@@ -1558,7 +2231,10 @@ def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
             normalize_icon(ICON_DIR / f"{icon_slug}.png")
         apply_badge(icon_slug, ego)
         print(f"  installed  {name}")
-        notify(f"added {name} — find it in the launcher")
+        if agent_icon and agent_find_icon(slug, name, app_url):
+            notify(f"added {name} — the agent is finding an icon")
+        else:
+            notify(f"added {name} — find it in the launcher")
 
         if want_rule and domain:
             owner = app_rule_conflict(domain)
@@ -1600,13 +2276,22 @@ opens on the workspace you are on - never by switching desktops.
                          lift a Chrome-internal profile into its own ego
                          (needs Chrome fully quit)
   omaego learn [--agent] suggest rules from where links actually went
+  omaego sync [--remote <git url>]
+                         rewrite desktop entries, relink native messaging hosts;
+                         and when ~/.config/omaego is a git repo, keep it (rules,
+                         egos, web apps) in sync with your private remote: pull,
+                         and hand commits and merges to the default agent
+  omaego sync --status [--fetch] [--json]   drift between repo and machine
+  omaego apply [--prune] make this machine match egos.toml
+  omaego app open <ego> "<app>"   launch, installing a declared app first
   omaego rule list       the routing rules
   omaego rule add <url-glob> <ego> [--app]
   omaego app list        web apps you can pin to an ego
   omaego app add <ego> <app>...   install them (--rule also routes that host)
   omaego app add <ego> --url <url> | --name <name>
                          either one is enough; you are asked for the other
-  omaego app remove <ego> <app>...
+  omaego app remove <ego> [<app>...]  by name or key; with none, pick one
+  omaego app edit <ego> "<app>" [--name <name>] [--icon <src>] [--agent-icon]
   omaego app icon <ego> "<app name>" <image url|path|--agent>
   omaego app rebadge [ego]        stamp ego badges on installed app icons
   omaego launch <slug> [url]
@@ -1624,7 +2309,6 @@ opens on the workspace you are on - never by switching desktops.
   omaego space [--json]  which ego owns the current workspace
   omaego here [--json]   browser and web-app windows on the current workspace
   omaego setup           first-run wiring: handler, desktop entries, rules file
-  omaego sync            rewrite desktop entries, relink native messaging hosts
   omaego restructure     name each inner profile dir after its ego, so web-app
                          windows identify their ego (rarely needed)
 
@@ -1730,6 +2414,12 @@ def main(argv):
             print(f"ego {slugify(name)!r} already exists", file=sys.stderr)
             return 1
         slug = add_profile(name, eng, existing_arg)
+        if "--open" in sys.argv:
+            # From the panel's "Set up here": open it, so signing in comes first.
+            ego = profiles()[slug]
+            launch(ego, new_window=True)
+            notify(f"{ego['name']} is set up here, in {ego['engine']['short']} - sign in")
+            return 0
         if existing_arg:
             ego = profiles()[slug]
             print(f"{name} is now {ego['engine']['short']}'s own profile "
@@ -1851,6 +2541,7 @@ def main(argv):
                     print(f"rule for {pat} already exists -> {r.get('profile')}",
                           file=sys.stderr)
                     return 1
+            RULES.parent.mkdir(parents=True, exist_ok=True)
             with RULES.open("a") as f:
                 f.write(f'\n[[rule]]\nurl = "{pat}"\nprofile = "{ego["name"]}"\n')
                 if "--app" in sys.argv[1:]:
@@ -1875,6 +2566,7 @@ def main(argv):
                 if (r.get("url") or r.get("match")) == pat:
                     notify(f"a rule for {pat} already exists")
                     return 1
+            RULES.parent.mkdir(parents=True, exist_ok=True)
             with RULES.open("a") as f:
                 f.write(f'\n[[rule]]\nurl = "{pat}"\nprofile = "{ego["name"]}"\n')
             notify(f"{pat} -> {ego['name']}")
@@ -1902,8 +2594,10 @@ def main(argv):
                 tail = f"  [rule: {dom}]" if dom else ""
                 print(f"  {k:<10} {nm:<10} {url}{tail}")
             print("\n  omaego app add <ego> <app>...            install them\n  omaego app add <ego> <app> --rule        also route that host to the ego")
-            print("  omaego app add <ego> --url <url> --name <name>")
-            print("  omaego app remove <ego> <app>...")
+            print("  omaego app add <ego> --url <url> --name <name> "
+                  "[--icon <image url|path>] [--agent-icon]")
+            print("  omaego app remove <ego> [<app>...]        by name or key; none: pick one")
+            print('  omaego app edit <ego> "<app>" [--name <name>] [--icon <src>] [--agent-icon]')
             print('  omaego app icon <ego> "<app name>" <image url|path|--agent>')
             print("  omaego app rebadge [ego]        stamp ego badges on icons")
             print('  omaego app rename <ego> "<old>" "<new>"')
@@ -1916,22 +2610,7 @@ def main(argv):
 
         if sub in ("rename", "fixnames"):
             egos = profiles()
-            def do_rename(slug, app, new_name):
-                old_desktop = DESKTOP_DIR / app["desktop"]
-                old_slug = app["icon"] if app["icon"] and "/" not in app["icon"] else None
-                new_slug = re.sub(r"[^a-z0-9]+", "-", new_name.lower()).strip("-")
-                txt = old_desktop.read_text()
-                txt = re.sub(r"^Name=.*$", f"Name={new_name}", txt, flags=re.M)
-                if old_slug:
-                    for suffix in (".png", ".orig.png"):
-                        src = ICON_DIR / f"{old_slug}{suffix}"
-                        if src.exists():
-                            src.rename(ICON_DIR / f"{new_slug}{suffix}")
-                    txt = re.sub(r"^Icon=.*$", f"Icon={new_slug}", txt, flags=re.M)
-                (DESKTOP_DIR / f"{new_name}.desktop").write_text(txt)
-                if old_desktop.name != f"{new_name}.desktop":
-                    old_desktop.unlink(missing_ok=True)
-                print(f"  {app['name']}  ->  {new_name}")
+            do_rename = lambda slug, app, new_name: rename_app(app, new_name)
 
             if sub == "rename":
                 if len(argv) < 5:
@@ -1995,25 +2674,8 @@ def main(argv):
                     return 0
                 if src.strip().lower() == "agent":
                     return 0 if agent_find_icon(slug, app["name"], app["url"]) else 1
-            icon_slug = re.sub(r"[^a-z0-9]+", "-", app["name"].lower()).strip("-")
-            ICON_DIR.mkdir(parents=True, exist_ok=True)
-            dest = ICON_DIR / f"{icon_slug}.png"
-            ok = (Path(src).exists() and shutil.copy(src, dest)) or fetch_icon(src, dest)
-            if not (ok and normalize_icon(dest)):
-                print(f"could not use {src}", file=sys.stderr)
-                notify(f"could not use that image for {app['name']}")
+            if not set_app_icon(slug, app, src):
                 return 1
-            (ICON_DIR / f"{icon_slug}.orig.png").unlink(missing_ok=True)
-            apply_badge(icon_slug, profiles()[slug])
-            d = DESKTOP_DIR / app["desktop"]
-            d.write_text(re.sub(r"^Icon=.*$", f"Icon={icon_slug}", d.read_text(),
-                                flags=re.M))
-            subprocess.run(["gtk-update-icon-cache",
-                            str(Path.home() / ".local/share/icons/hicolor")],
-                           capture_output=True)
-            subprocess.run(["update-desktop-database", str(DESKTOP_DIR)],
-                           capture_output=True)
-            print(f"  {app['name']}: icon set from {src}")
             notify(f"{app['name']}: icon updated")
             return 0
 
@@ -2048,19 +2710,39 @@ def main(argv):
             return 0
 
         if sub == "catalog":
+            # `catalog [ego]` lists; `catalog --fetch` fills the icon cache.
+            if "--fetch" in sys.argv:
+                print(f"{catalog_fetch()} icon(s) fetched")
+                return 0
+            slug = argv[2] if len(argv) > 2 else None
+            have = {a["url"] for a in installed_apps().get(slug, [])} if slug else set()
             print(json.dumps([
-                {"key": k, "name": v[0], "url": v[1], "ruleDomain": v[2]}
-                for k, v in sorted(WEBAPPS.items())]))
+                {"key": k, "name": v[0], "url": v[1], "ruleDomain": v[2],
+                 "host": urlsplit(v[1]).hostname, "installed": v[1] in have,
+                 "iconPath": str(catalog_icon(k)) if catalog_icon(k).exists() else ""}
+                for k, v in sorted(WEBAPPS.items(), key=lambda kv: kv[1][0].lower())]))
+            return 0
+
+        if sub == "probe":
+            # For the panel's create form: never prompts, always prints JSON.
+            if len(argv) < 4:
+                print("usage: omaego app probe <ego> <url> [--names] "
+                      "[--icon <image url|path>]",
+                      file=sys.stderr)
+                return 2
+            raw = sys.argv[1:]
+            icon = next((raw[i + 1] for i, a in enumerate(raw)
+                         if a == "--icon" and i + 1 < len(raw)), None)
+            ego = profiles().get(argv[2])
+            print(json.dumps(app_probe(argv[3], ego["name"] if ego else None, icon,
+                                       names_only="--names" in raw)))
             return 0
 
         if sub == "pick":
-            # Free text FIRST, then the catalogue.
-            #
-            # walker's dmenu filters its rows against what is typed and has no
-            # flag to hand back unmatched input, so a pasted URL hides every row
-            # and Enter returns nothing. Asking first is the only way a URL can
-            # be entered at all; Enter on an empty prompt falls through to the
-            # catalogue, so browsing still works.
+            # One search over the catalogue. Enter takes the highlighted row and
+            # nothing else: a lone match is never added on its own. Text that
+            # matches no row starts a custom app - a URL asks for its name next,
+            # a name asks for its URL. Esc adds nothing.
             if len(argv) < 3:
                 print("usage: omaego app pick <ego>", file=sys.stderr)
                 return 2
@@ -2069,28 +2751,103 @@ def main(argv):
                 print(f"unknown ego {slug!r}", file=sys.stderr)
                 return 1
             name = profiles()[slug]["name"]
-            typed = (prompt_text(f"{name}: paste a URL then Enter · a name then "
-                                 f"Enter · or Enter alone to browse") or "").strip()
-
-            if typed:
-                hit = next((k for k, v in WEBAPPS.items()
-                            if v[0].lower() == typed.lower()
-                            or k.lower() == typed.lower()), None)
-                if hit:
-                    return app_add(slug, [hit], interactive=True)
-                looks_like_url = "://" in typed or ("." in typed and " " not in typed)
-                return app_add(slug, [],
-                               url=typed if looks_like_url else None,
-                               display=None if looks_like_url else typed,
-                               interactive=True)
-
             have = {a["url"] for a in installed_apps().get(slug, [])}
-            opts = [(v[0], k) for k, v in sorted(WEBAPPS.items()) if v[1] not in have]
-            if not opts:
-                notify(f"every catalogue app is already installed for {name}")
+            opts = [(v[0], k) for k, v in sorted(WEBAPPS.items(),
+                                                 key=lambda kv: kv[1][0].lower())
+                    if v[1] not in have]
+            opts.append(("Custom app…", "__custom__"))
+            chosen = pick(opts, f"Add to {name}: search, or paste a URL / "
+                                f"type a name for your own", free=True, single=False)
+            if chosen is None:
                 return 0
-            key = pick(opts, f"Add a web app to {name}…")
-            return 0 if key is None else app_add(slug, [key], interactive=True)
+            if chosen == "__custom__":
+                chosen = ("free", (prompt_text(f"Custom app in {name}: paste its "
+                                               f"URL, or type its name") or "").strip())
+                if not chosen[1]:
+                    return 0
+            if isinstance(chosen, tuple):
+                typed = chosen[1]
+                key = catalog_match(typed)
+                if key and WEBAPPS[key][1] not in have:
+                    return app_add(slug, [key], interactive=True)
+                if looks_like_url(typed):
+                    return app_add(slug, [], url=typed, interactive=True)
+                return app_add(slug, [], display=typed, interactive=True)
+            return app_add(slug, [chosen], interactive=True)
+
+        if sub == "open":
+            # What a click on an app in the panel does: launch it, installing it
+            # first when egos.toml declares it but this machine never has.
+            if len(argv) < 4:
+                print('usage: omaego app open <ego> "<app>"', file=sys.stderr)
+                return 2
+            slug, want = argv[2], argv[3]
+            if slug not in profiles():
+                print(f"unknown ego {slug!r}", file=sys.stderr); return 1
+            app = find_app(slug, want)
+            if app is None:
+                ego_name = profiles()[slug]["name"]
+                decl = next((a for a in pending_apps(slug)
+                             if want.lower() in (a["name"].lower(),
+                                                 APP_NAME_TEMPLATE.format(app=a["name"], ego=ego_name).lower())), None)
+                if decl is None:
+                    notify(f"no web app {want!r} in {ego_name}")
+                    return 1
+                notify(f"installing {decl['name']} for {ego_name}…")
+                app = install_declared(slug, decl)
+                if app is None:
+                    notify(f"could not install {decl['name']}")
+                    return 1
+            subprocess.Popen(["sh", "-c", app["exec"]], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return 0
+
+        if sub == "edit":
+            # What the panel's edit form saves: a new name, a new icon, or both.
+            raw = sys.argv[1:]
+            def flagval(name):
+                for i, a in enumerate(raw):
+                    if a == name and i + 1 < len(raw):
+                        return raw[i + 1]
+                    if a.startswith(name + "="):
+                        return a.split("=", 1)[1]
+                return None
+            if len(argv) < 4:
+                print('usage: omaego app edit <ego> "<app>" [--name <name>] '
+                      "[--icon <image url|path>] [--agent-icon]", file=sys.stderr)
+                return 2
+            slug, want = argv[2], argv[3]
+            app = find_app(slug, want)
+            if app is None:
+                print(f"no app {want!r} in {slug}", file=sys.stderr)
+                notify(f"no web app {want!r} to edit")
+                return 1
+            ego_name = profiles()[slug]["name"]
+            changed = []
+            new = (flagval("--name") or "").strip()
+            if new:
+                # The form edits the short name; the ego is always appended.
+                full = new if re.search(rf"\b{re.escape(ego_name)}\b", new, re.I) \
+                    else APP_NAME_TEMPLATE.format(app=new, ego=ego_name)
+                if full != app["name"]:
+                    if (DESKTOP_DIR / f"{full}.desktop").exists():
+                        notify(f"{full} already exists")
+                        return 1
+                    rename_app(app, full)
+                    app = find_app(slug, full)
+                    changed.append(f"renamed to {full}")
+            icon = flagval("--icon")
+            if icon:
+                if not set_app_icon(slug, app, icon):
+                    return 1
+                changed.append("icon updated")
+            if "--agent-icon" in raw:
+                if agent_find_icon(slug, app["name"], app["url"]):
+                    changed.append("the agent is looking for an icon")
+            subprocess.run(["update-desktop-database", str(DESKTOP_DIR)],
+                           capture_output=True)
+            notify(f"{app['name']}: " + (", ".join(changed) or "nothing changed"))
+            return 0
 
         if sub in ("add", "remove"):
             if len(argv) < 3:
@@ -2100,7 +2857,7 @@ def main(argv):
             raw = sys.argv[1:]
             # A flag's VALUE does not start with "-", so it survives the flag
             # strip above and would otherwise be read as a catalogue key.
-            for flag in ("--url", "--name", "--name-template"):
+            for flag in ("--url", "--name", "--name-template", "--icon"):
                 for i, a in enumerate(raw):
                     if a == flag and i + 1 < len(raw):
                         keys = [k for k in keys if k != raw[i + 1]]
@@ -2116,19 +2873,44 @@ def main(argv):
             if sub == "add":
                 return app_add(slug, keys, name_tpl=flagval("--name-template"),
                                url=flagval("--url"), display=flagval("--name"),
-                               want_rule="--rule" in raw)
-            egos = profiles()
-            if slug not in egos:
+                               want_rule="--rule" in raw, icon=flagval("--icon"),
+                               agent_icon="--agent-icon" in raw)
+            if slug not in profiles():
                 print(f"unknown ego {slug!r}", file=sys.stderr); return 1
-            tpl = flagval("--name-template") or APP_NAME_TEMPLATE
+            ego_name = profiles()[slug]["name"]
+            if not keys:
+                # From a keybinding or the launcher: pick which one.
+                apps = installed_apps().get(slug, [])
+                if not apps:
+                    notify(f"{ego_name} has no web apps")
+                    return 0
+                chosen = pick([(a["name"], a["name"]) for a in apps],
+                              f"Remove a web app from {ego_name}…", single=False)
+                if chosen is None:
+                    return 0
+                keys = [chosen]
+            rc = 0
             for k in keys:
-                if k not in WEBAPPS:
-                    print(f"unknown app {k!r}", file=sys.stderr); continue
-                name = tpl.format(app=WEBAPPS[k][0], ego=egos[slug]["name"])
-                r = subprocess.run(["omarchy", "webapp", "remove", name],
-                                   capture_output=True, text=True)
-                print(f"  {'removed  ' if r.returncode == 0 else 'not found'}  {name}")
-            return 0
+                app = find_app(slug, k)
+                if app is None:
+                    # Declared in egos.toml but never installed here.
+                    decl = next((a for a in pending_apps(slug)
+                                 if k.lower() in (a["name"].lower(), (a.get("key") or "").lower(),
+                                                  APP_NAME_TEMPLATE.format(app=a["name"], ego=ego_name).lower())), None)
+                    if decl:
+                        forget_declared(slug, decl["url"])
+                        print(f"  forgotten  {decl['name']}")
+                        notify(f"removed {decl['name']} from {ego_name}")
+                        continue
+                    print(f"  not found  {k}", file=sys.stderr)
+                    notify(f"no web app {k!r} in {ego_name}")
+                    rc = 1
+                    continue
+                remove_app(app)
+                forget_declared(slug, app["url"])
+                print(f"  removed    {app['name']}")
+                notify(f"removed {app['name']}")
+            return rc
 
         print(f"unknown: omaego app {sub}", file=sys.stderr)
         return 2
@@ -2213,11 +2995,6 @@ def main(argv):
             missing = "" if shutil.which(t["engine"]["command"]) else "  NOT INSTALLED"
             print(f"  {t['name']:<22} {t['engine']['name']}{missing}")
         return 0 if shutil.which(eng["command"]) else 1
-
-    if cmd == "sync":
-        write_desktop_entries()
-        print("desktop entries written")
-        return 0
 
     if cmd == "here":
         rows = browsers_here()
@@ -2310,6 +3087,121 @@ def main(argv):
         highlight("all" if len(argv) > 1 and argv[1] == "all" else None)
         return 0
 
+    if cmd == "apply":
+        # Make this machine match egos.toml, e.g. after editing it by hand.
+        done = apply_repo(prune="--prune" in sys.argv)
+        for line in done:
+            print(f"  {line}")
+        print("nothing to apply" if not done else f"{len(done)} change(s)")
+        if done and not sys.stdout.isatty():
+            notify("applied egos.toml: " + ", ".join(done[:4])
+                   + (" …" if len(done) > 4 else ""))
+        return 0
+
+    if cmd == "sync":
+        raw = sys.argv[1:]
+        if "--status" in raw:
+            st = sync_status(fetch="--fetch" in raw)
+            if want_json:
+                print(json.dumps(st))
+            else:
+                print(st["state"], *(f"{k}={st[k]}" for k in ("local", "ahead", "behind") if st[k]))
+                for c in st.get("changes", []):
+                    print(f"  {c}")
+            return 0
+        url = next((raw[i + 1] for i, a in enumerate(raw)
+                    if a == "--remote" and i + 1 < len(raw)), None)
+        if "--setup" in raw and not url:
+            # From the panel: ask where the private repo lives.
+            url = (prompt_text("Your private git repo for egos and rules, "
+                               "e.g. git@github.com:you/myomaego.git") or "").strip()
+            if not url:
+                return 0
+        # The local half first, as `sync` always did: desktop entries and the
+        # native messaging links. It is what a package upgrade asks for.
+        write_desktop_entries()
+        print("desktop entries written")
+        if not (CONFIG_DIR / ".git").exists():
+            if not url:
+                print("~/.config/omaego is not a git repo, so there is nothing to "
+                      "pull or push.\nTo keep your egos in a private repo: "
+                      "omaego sync --remote <git url>")
+                return 0
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            git("init", "--quiet", "-b", "main")
+        ensure_gitignore()
+        if url:
+            r = git("remote", "set-url", "origin", url)
+            if r.returncode != 0:
+                git("remote", "add", "origin", url)
+        # A repo with no commits yet, against a remote that has some: a new
+        # machine. With nothing of its own to keep, take the remote as it is.
+        remote = (git("remote").stdout.split() or [None])[0]
+        if remote and git("rev-parse", "--verify", "--quiet", "HEAD").returncode != 0:
+            git("fetch", "--quiet", remote, timeout=60)
+            head = git("symbolic-ref", "--short", f"refs/remotes/{remote}/HEAD").stdout.strip()
+            branch = head.split("/", 1)[1] if "/" in head else "main"
+            mine = bool(profiles()) or bool(load_rules())
+            if git("rev-parse", "--verify", "--quiet", f"{remote}/{branch}").returncode == 0 \
+                    and not mine:
+                git("checkout", "--quiet", "-f", "-B", branch, "--track", f"{remote}/{branch}")
+                ensure_gitignore()
+                n = len(available_egos())
+                msg = (f"your rules and {n} ego{'s' if n != 1 else ''} from {remote}: "
+                       f"set up the ones you want here from the panel")
+                print(msg); notify("egos: " + msg)
+                return 0
+        changed = export_repo(write=True)
+        st = sync_status(fetch=True)
+        remote = st.get("remote")
+        if remote and not st.get("upstream"):
+            # A remote with history but no tracking branch yet: track it.
+            branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main"
+            if git("rev-parse", "--verify", "--quiet", f"{remote}/{branch}").returncode == 0:
+                git("branch", f"--set-upstream-to={remote}/{branch}")
+                st = sync_status()
+        if st["state"] == "clean":
+            print("in sync"); notify("egos: in sync")
+            return 0
+        if st["state"] == "behind":
+            r = git("merge", "--ff-only", "--quiet", "@{u}")
+            if r.returncode == 0:
+                done = apply_repo(prune=True)
+                msg = f"pulled {st['behind']} change(s)" + (": " + ", ".join(done[:4]) if done else "")
+                print(msg); notify("egos: " + msg)
+                return 0
+        # Anything to commit, push or merge goes to the agent: it writes the
+        # commit message from the diff, and resolves conflicts with judgement.
+        where = f"{remote} ({st.get('upstream') or 'no upstream yet'})" if remote else "no remote"
+        prompt = (
+            f"Sync my omaego configuration repo, {CONFIG_DIR} (your working "
+            f"directory), with its remote: {where}.\n\n"
+            f"It holds rules.toml (which URLs open in which browser ego), "
+            f"account-hosts, egos.toml (my egos, their colours and web apps) and "
+            f"icons/ (each web app's unbadged icon). omaego has just written this "
+            f"machine's state into it. Now: {st['local']} changed file(s), "
+            f"{st['ahead']} commit(s) not pushed, {st['behind']} commit(s) on the "
+            f"remote not pulled.\n\n"
+            f"1. Look at `git status` and `git diff`, and commit the local changes "
+            f"with short messages in my terms, e.g. \"Acme: add Outlook, route "
+            f"acme.atlassian.net\". Split unrelated changes into separate commits.\n"
+            f"2. Pull with rebase. Resolve conflicts keeping the intent of both "
+            f"sides: what either side added stays; what one side removed and the "
+            f"other left alone goes; when both changed the same thing differently, "
+            f"ask me. egos.toml and rules.toml must stay valid TOML - check each "
+            f"with: python3 -c 'import tomllib,sys; tomllib.load(open(sys.argv[1],\"rb\"))' FILE\n"
+            f"3. Push (with -u if the branch has no upstream yet).\n"
+            f"4. Run `omaego apply --prune` so this machine matches the repo, then "
+            f"`omaego sync --status`, which should print \"clean\".\n\n"
+            f"Work only inside {CONFIG_DIR}. Nothing from "
+            f"~/.local/share/chrome-profiles (logins, cookies) belongs in this repo.")
+        if not run_agent(prompt, cwd=CONFIG_DIR):
+            return 1
+        print(f"handed to the agent: {st['state']}, {st['local']} local, "
+              f"{st['ahead']} ahead, {st['behind']} behind")
+        notify("egos: the agent is syncing")
+        return 0
+
     if cmd == "panel":
         # Everything the bar panel renders, in one call - four separate
         # processes per open would be four Chrome-free but still pointless forks.
@@ -2325,6 +3217,11 @@ def main(argv):
                  for r in load_rules()]
         egos = sorted(profiles().values(), key=lambda t: t["name"])
         names = {t["name"].lower() for t in egos} | {t["slug"] for t in egos}
+        declared = load_declared()
+        avail = available_egos()
+        # A rule for an ego in your repo but not on this device belongs on that
+        # ego's card, not among the rules for no ego at all.
+        names |= {e["name"].lower() for e in avail.values()} | set(avail)
 
         def panel_app(a, ego_name):
             # "Outlook Work" is the launcher's name; inside the Work column the
@@ -2346,13 +3243,27 @@ def main(argv):
                       "browser": t["engine"]["short"],
                       "here": t["wm_class"] in here,
                       "focused": t["wm_class"] == focused_cls,
-                      "apps": [panel_app(a, t["name"]) for a in inst.get(t["slug"], [])],
+                      "apps": [panel_app(a, t["name"]) for a in inst.get(t["slug"], [])]
+                              + [{"name": APP_NAME_TEMPLATE.format(app=a["name"], ego=t["name"]),
+                                  "short": a["name"], "url": a["url"], "pending": True,
+                                  "iconPath": str(CONFIG_DIR / a["icon"]) if a.get("icon")
+                                              and (CONFIG_DIR / a["icon"]).is_file() else "",
+                                  "desktop": "", "exec": ""}
+                                 for a in declared.get(t["slug"], {}).get("apps", [])
+                                 if a["url"] not in {x["url"] for x in inst.get(t["slug"], [])}],
                       "rules": [r for r in rules if owns(t, r)]}
                      for t in egos],
             # Rules with no ego (rewrite/app-only) or naming one that is gone.
             "looseRules": [r for r in rules
                            if (r["profile"] or "").lower() not in names],
             "rules": rules,
+            "sync": sync_status(),
+            # Egos in your repo that are not set up on this device.
+            "available": [{"slug": k, "name": e["name"], "color": "#" + (e.get("color") or "7aa2f7"),
+                           "apps": [a["name"] for a in e["apps"]],
+                           "rules": [r for r in rules
+                                     if (r["profile"] or "").lower() in (k, e["name"].lower())]}
+                          for k, e in sorted(avail.items(), key=lambda kv: kv[1]["name"])],
         }))
         return 0
 
