@@ -230,6 +230,23 @@ Idempotent, and backs up anything it replaces. It links `bin/` into
 the `chromium.desktop` shim, registers omaego as the default browser, and
 relinks native-messaging hosts into every ego.
 
+On Chromium, `omaego setup` also lets it sign in to Google accounts. Arch's
+Chromium has no Google API keys, so out of the box it cannot. Setup runs
+Omarchy's `omarchy-install-chromium-google-account`, which adds Chrome's OAuth
+client to `~/.config/chromium-flags.conf`. That file is read by every Chromium
+launch, so it is one switch for the whole device, and every Chromium ego made
+later gets it too. It is optional:
+
+```bash
+omaego setup --no-google-signin   # remove the flags, and keep them off on this device
+omaego setup --google-signin      # turn it back on
+```
+
+A profile can still have sign-in switched off in its own settings, which the
+flags do not override. `omaego setup` and `omaego add --existing` say so when
+one does: turn on **Allow Chromium sign-in** under Settings → You and Google →
+Sync and Google services.
+
 Egos run in **omarchy's default browser** — whatever `omarchy default browser`
 said when omaego took over, remembered in `~/.config/omaego/engine`. Chrome,
 Chromium, Brave and Edge can be the engine; Firefox cannot (no
@@ -305,7 +322,24 @@ omaego sync --remote git@github.com:you/myomaego.git
 ```
 
 What is synced: `rules.toml`, `account-hosts`, and `egos.toml` (each ego's name
-and colour, and its web apps), plus each app's unbadged icon under `icons/`.
+and colour, the accounts it signs in with if you keep any, and its web apps),
+plus each app's unbadged icon under `icons/`.
+
+**Accounts are optional.** An ego works the same without them. When it has
+some, a device setting that ego up is told which one to sign in with. Google
+accounts are read from the browser on each sync. Anything else, such as a
+Microsoft account, you note yourself:
+
+```bash
+omaego account                                  # every ego and its accounts
+omaego account add oms you@customer.example     # also for egos not on this device
+omaego account remove oms you@customer.example
+```
+
+A sync adds the accounts a browser is signed in to, and never drops one
+because a device is signed out. Removing one is always `omaego account
+remove`. `OMAEGO_NO_ACCOUNTS=1` stops omaego from reading the browser at all,
+so `egos.toml` only holds the accounts you add.
 
 What stays on the device: the browser data itself (logins, cookies, history),
 which browser each ego runs in (Chrome on one machine, Chromium on another),
@@ -409,9 +443,10 @@ omarchy's default, and Python 3.11+ for `tomllib`. The picker and prompts use
 the menu the desktop already has: Omarchy 4's own (`omarchy-menu-select`), or
 `walker` on Omarchy 3. `./install.sh` and `omaego setup` say which one they
 found, or that neither is there. Tested
-with Chrome and Chromium; Brave and Edge are wired up but untested. Chromium
-has no Google sync on Arch (`signin allowed: false`), so its egos are isolated
-islands — use Chrome if each ego should sync to its own account.
+with Chrome and Chromium; Brave and Edge are wired up but untested. Arch's
+Chromium cannot sign in to Google accounts on its own. `omaego setup` turns that
+on unless you opt out (see [Install](#install)). Use Chrome if each ego should
+sync to its own account for certain.
 
 ## Regenerating the screenshots
 
