@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Run a TUI - a herdr session, anything over ssh - and bring it back when the
+# connection drops, instead of leaving a dead terminal.
+#
+#   omaego-remote --label "herdr @box" [--machine user@host] -- <command...>
+#
+# A clean exit (status 0: herdr detached, the program quit) ends it. Any other
+# exit counts as a lost connection: it waits with backoff, and with --machine
+# only retries once that machine answers on ssh's port again. Enter retries at
+# once, q gives up.
+set -u
+
+LABEL="" MACHINE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --label)   LABEL="$2"; shift 2 ;;
+    --machine) MACHINE="$2"; shift 2 ;;
+    --)        shift; break ;;
+    *)         break ;;
+  esac
+done
+[ $# -gt 0 ] || { echo "usage: omaego-remote [--label L] [--machine HOST] -- <command...>" >&2; exit 2; }
+LABEL=${LABEL:-$1}
+HOST=${MACHINE#*@}
+
+title() { printf '\033]0;%s\007' "$1"; }
+dim()   { printf '\033[2m%s\033[0m\n' "$*"; }
+trap 'echo; exit 130' INT
+
+reachable() {
+  [ -z "$HOST" ] && return 0
+  timeout 3 bash -c "exec 3<>/dev/tcp/$HOST/22" 2>/dev/null
+}
+
+# Wait up to $1 seconds; return 1 when the user pressed q.
+pause() {
+  local left=$1 key
+  while [ "$left" -gt 0 ]; do
+    printf '\r\033[K\033[2m%s in %ss · Enter: now · q: quit\033[0m' "$2" "$left"
+    if read -rsn1 -t 1 key; then
+      [ "$key" = q ] && { echo; return 1; }
+      break
+    fi
+    left=$((left - 1))
+  done
+  printf '\r\033[K'
+}
+
+backoff=2
+while :; do
+  title "$LABEL"
+  started=$SECONDS
+  "$@"
+  rc=$?
+  [ $rc -eq 0 ] && exit 0
+  # A session that stayed up a while dropped; start the backoff over.
+  [ $((SECONDS - started)) -ge 60 ] && backoff=2
+  echo
+  dim "── $LABEL: connection lost (exit $rc)"
+  title "$LABEL (reconnecting)"
+  pause "$backoff" "reconnecting" || exit $rc
+  backoff=$(( backoff * 2 > 30 ? 30 : backoff * 2 ))
+  until reachable; do
+    title "$LABEL (waiting for $HOST)"
+    pause 5 "waiting for $HOST" || exit $rc
+  done
+done

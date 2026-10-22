@@ -29,6 +29,11 @@ for [Omarchy](https://omarchy.org) and Hyprland.
   private git repo. One click syncs them, and the default agent writes the
   commits and resolves conflicts. See [Your egos in a private
   repo](#your-egos-in-a-private-repo).
+- **Agent sessions on any machine.** Pin a herdr session, any TUI or an agent
+  gateway (OpenClaw, Hermes) on any machine on your tailnet to an ego. It opens
+  directly where it runs and over ssh everywhere else, and reconnects when the
+  connection drops. See [Sessions and gateways on your
+  machines](#sessions-and-gateways-on-your-machines).
 - **Truly separate.** Each ego is its own browser `--user-data-dir`, with its own
   process, cookie jar, extensions and Google sync account. Logins and cookies
   are never shared between egos.
@@ -305,7 +310,8 @@ omaego sync --remote git@github.com:you/myomaego.git
 ```
 
 What is synced: `rules.toml`, `account-hosts`, and `egos.toml` (each ego's name
-and colour, and its web apps), plus each app's unbadged icon under `icons/`.
+and colour, its web apps, and the sessions and gateways pinned to it), plus
+each app's unbadged icon under `icons/`.
 
 What stays on the device: the browser data itself (logins, cookies, history),
 which browser each ego runs in (Chrome on one machine, Chromium on another),
@@ -332,6 +338,11 @@ Clicking it, or running `omaego sync`, does this:
    what changed, rebases, resolves conflicts (and asks you when both sides
    changed the same thing), pushes, and runs `omaego apply --prune`.
 
+The order in `egos.toml` is the order on the panel, on every device: the
+cards, and each card's apps and remotes. Drag a card by its name, or an app or
+remote row, to rearrange them (or move the blocks in the file). A new ego, app
+or remote goes last until you move it.
+
 An app is the same app on every device when its ego and URL match. Renaming,
 re-icon-ing and removing it carry over. Removing an *ego* does not, because a
 sync never deletes browser data. After editing `egos.toml` by hand, run
@@ -345,6 +356,72 @@ omaego app open acme Teams       # launch, installing a declared app first
 ```
 
 Syncing on a timer comes later. For now it happens when you click.
+
+## Sessions and gateways on your machines
+
+A herdr session, any TUI, or an agent's web gateway runs on one machine.
+omaego lets you pin it to an ego, so it sits on that ego's card next to its web
+apps, in the launcher as "herdr compose Work" with herdr's icon and the ego's
+badge, and syncs through your
+egos repo like everything else. Keep things apart the way you keep egos apart:
+each herdr session and each gateway is its own entry, never one shared session
+for everything.
+
+omaego knows which machine it is on (its Tailscale name, or the hostname
+without Tailscale), so one entry opens the right way on every device:
+
+| | On the machine it runs on | From any other machine |
+|---|---|---|
+| herdr session | `herdr --session <name>` | `herdr --remote <machine> --session <name>` |
+| TUI | the command, in a login shell | `ssh -t <machine>`, the command in a login shell there |
+| Gateway | `http://127.0.0.1:<port>` as a web app of the ego | that machine's Tailscale serve URL if it serves the port, else an ssh tunnel to its `127.0.0.1:<port>` |
+
+TUIs run under `omaego-remote`. When the connection drops, it does not leave
+a dead terminal: it says so, waits with backoff (and for the machine to answer
+again), and reattaches. A clean exit, such as detaching from herdr, closes it.
+The terminal's window class is `omaego.<ego>.<name>`, so the bar and the
+panel's outlines count it as that ego's window.
+
+A gateway tunnel always uses the same local port for the same machine and
+port, so the gateway's origin, and the login it stores, stay the same. The
+tunnel reconnects by itself and closes after ten idle minutes. Nothing new is
+exposed on the tailnet.
+
+**Add session or gateway** on a card looks at your machines that are online
+and offers what they have: their herdr sessions by name, a new herdr session,
+any TUI over ssh, and an OpenClaw (18789) or Hermes (9119) gateway answering on
+its default port. An agent is offered both ways: **web** opens its gateway's
+control UI as a web app of the ego, **TUI** runs `openclaw tui` or
+`hermes --tui` on its machine. Offline machines' entries stay on the card,
+faded.
+
+Each entry gets the tool's own icon (herdr's, OpenClaw's, Hermes', or your
+terminal's for any other TUI) with the ego's badge, on the card and in the
+launcher. The machine is in the launcher entry's keywords, so typing it finds
+the entry too.
+
+```bash
+omaego remote machines                         # this machine and your tailnet
+omaego remote add work herdr box compose       # a herdr session on "box"
+omaego remote add work web box 18789           # its OpenClaw gateway
+omaego remote add work tui box -- openclaw tui  # its OpenClaw, as a TUI
+omaego remote add acme tui box --name btop -- btop
+omaego remote list                             # every remote, and where it is
+omaego remote open work "herdr compose"
+omaego remote remove work "herdr compose"
+```
+
+In `egos.toml` a remote is one table under its ego:
+
+```toml
+[[ego.remote]]
+name = "herdr compose"
+kind = "herdr"            # herdr | tui | web
+machine = "box"           # its tailnet name; `ssh = "user@host"` overrides the target
+session = "compose"
+```
+
+Gateways also take `port`, `path` and a fixed `url`; TUIs take `command`.
 
 ## The bar widget
 

@@ -53,6 +53,16 @@ Chrome 154 / omarchy 4.0.4, where the two omarchy bugs below **still stand**.
 | `-X` / `--selectsingle` | Picks the last remaining row **by itself** while you are still typing. Never use it on a search, where one row left is a filter result and not a choice. |
 | `--inputonly` | Shows the input and nothing else, which looks identical to a broken picker. Say in the placeholder what Enter does. |
 
+## herdr and remotes
+
+| Thing | Reality |
+|---|---|
+| `herdr --remote` on a lost connection | Exits **1** and leaves the terminal at a shell, or closes it. There is no reconnect of its own; `omaego-remote` loops on any non-zero exit and treats 0 (detach, quit) as done. A herdr client killed mid-draw leaves its alternate screen behind until the reattach redraws it. |
+| Commands over ssh | `ssh host cmd` runs a non-login shell: `openclaw` in `~/.npm-global/bin`, mise shims, `~/.local/bin` are often not on its PATH. Remote TUIs run as `exec "$SHELL" -lc '<cmd>'`, local ones in `$SHELL -lc` (the bar's environment lacks them too). |
+| Probing a machine over ssh | A non-login shell often lacks `~/.local/bin`, so `herdr` is "not found" on a machine that has it. The probe runs in `"$SHELL" -l` with the script on stdin. |
+| Tailscale machine names | `HostName` is not unique: two Macs can both be `macbook-pro`. Use the MagicDNS label (`DNSName`'s first part), which is. |
+| Omarchy menu width | Rows are cut at about 25 characters. Put what tells rows apart first ("box: compose", not "herdr compose · box"). |
+
 ## Icons
 
 | Thing | Reality |

@@ -200,6 +200,8 @@ UNMANAGED = {e["class"]: (e["short"] if e["class"] != "google-chrome"
 APP_PREFIXES = tuple(sorted({e["app"] for e in ENGINES.values()}))
 # Windows that look like browsers but are somebody else's tool.
 IGNORED_CLASSES = {"chromium-browser"}
+# The terminal of a remote session: omaego.<ego slug>.<remote id>.
+REMOTE_CLASS = "omaego."
 
 
 def is_browser_class(cls):
@@ -561,9 +563,18 @@ def browsers_here():
     # first - and is therefore the one a link defaults to.
     clients = sorted(clients, key=lambda c: (c.get("at", [0, 0])[1],
                                              c.get("at", [0, 0])[0]))
+    slug_class = {t["slug"]: t["wm_class"] for t in known.values() if t.get("slug")}
+    pinned = remote_owners()
     for c in clients:
         cls = c.get("class", "")
         if cls in IGNORED_CLASSES or c.get("workspace", {}).get("id") != ws:
+            continue
+        if cls.startswith(REMOTE_CLASS):
+            # A remote's terminal (omaego.<ego>.<remote>): like a web app, it
+            # says which ego is on this desktop and is never a link target.
+            prof = slug_class.get(remote_owner(cls, pinned))
+            if prof:
+                found.append((None, prof, False))
             continue
         if not (cls in known or is_browser_class(cls)):
             continue
@@ -1026,11 +1037,13 @@ def highlight(mode=None):
     clients = hyprctl("clients") or []
     by_addr = {c["address"]: c for c in clients}
     want = {}
+    pinned = remote_owners()
     if mode == "all":
         for slug, prof in profiles().items():
             colour = ego_color(slug)
             for c in clients:
-                if c.get("class") != prof["wm_class"]:
+                if c.get("class") != prof["wm_class"] \
+                        and remote_owner(c.get("class", ""), pinned) != slug:
                     continue
                 addr = c["address"]
                 if c.get("hidden") and c.get("grouped"):
@@ -1041,7 +1054,7 @@ def highlight(mode=None):
     cmds = []
     for c in clients:
         cls = c.get("class", "")
-        if not is_browser_class(cls):
+        if not (is_browser_class(cls) or cls.startswith(REMOTE_CLASS)):
             continue
         colour = want.get(c["address"])
         # Only the INACTIVE colour. Setting the active one too made a focused
@@ -1095,8 +1108,9 @@ def ego_options(by_class, first=()):
     knowing before you pick. When nothing is here the prompt already says so,
     and marking every row would just be noise.
     """
-    here_first = [t for c, t in sorted(by_class.items()) if c in first]
-    rest = [t for c, t in sorted(by_class.items()) if c not in first]
+    order = sorted(by_class.items(), key=lambda ct, k=ego_sort_key(): k(ct[1]))
+    here_first = [t for c, t in order if c in first]
+    rest = [t for c, t in order if c not in first]
     mark = " · not on this desktop" if here_first else ""
     rows = [(t["name"], t) for t in here_first]
     rows += [(t["name"] + mark, t) for t in rest]
@@ -1804,7 +1818,7 @@ def short_name(name, ego_name):
 
 
 def load_declared():
-    """egos.toml as slug -> {name, color, fallback, apps}. Empty when absent."""
+    """egos.toml as slug -> {name, color, apps, remotes}. Empty when absent."""
     try:
         data = tomllib.loads(EGOS_FILE.read_text())
     except FileNotFoundError:
@@ -1820,8 +1834,22 @@ def load_declared():
                 "name": e.get("name") or e["slug"].title(),
                 "color": (e.get("color") or "").lstrip("#") or None,
                 "apps": [a for a in e.get("app", []) if a.get("url") and a.get("name")],
+                "remotes": [r for r in e.get("remote", [])
+                            if r.get("name") and r.get("machine")
+                            and r.get("kind") in REMOTE_KINDS],
             }
     return out
+
+
+def ego_sort_key():
+    """Sort key for egos: their order in egos.toml, which you can rearrange by
+    hand; egos it does not list yet come after, by name. Takes an ego dict
+    (with slug and name) or a (slug, name) pair."""
+    rank = {k: i for i, k in enumerate(load_declared())}   # file order
+    def key(t):
+        slug, name = (t["slug"], t["name"]) if isinstance(t, dict) else t
+        return (rank.get(slug, len(rank)), (name or slug).lower())
+    return key
 
 
 def local_icon(app):
@@ -1846,7 +1874,10 @@ def repo_state():
     """
     decl, egos, inst = load_declared(), profiles(), installed_apps()
     state, icons = {}, {}
-    for slug in sorted(set(egos) | set(decl)):
+    # The file's order is kept: it is the order of the cards, and yours to edit.
+    key = ego_sort_key()
+    names = {**{k: d["name"] for k, d in decl.items()}, **{k: e["name"] for k, e in egos.items()}}
+    for slug in sorted(set(egos) | set(decl), key=lambda k: key((k, names[k]))):
         d = decl.get(slug, {})
         here = slug in egos
         name = egos[slug]["name"] if here else d["name"]
@@ -1863,10 +1894,16 @@ def repo_state():
         for a in d.get("apps", []):
             if a["url"] not in apps:
                 apps[a["url"]] = {k: a[k] for k in ("name", "url", "key", "icon") if a.get(k)}
+        # The file's order, which dragging on the card rearranges; apps it
+        # does not list yet go after, by name.
+        rank = {a["url"]: i for i, a in enumerate(d.get("apps", []))}
         state[slug] = {
             "name": name,
             "color": ego_color(slug) if here else d.get("color"),
-            "apps": sorted(apps.values(), key=lambda x: x["name"].lower()),
+            "apps": sorted(apps.values(),
+                           key=lambda x: (rank.get(x["url"], len(rank)), x["name"].lower())),
+            # Remotes exist only as declarations: nothing on disk to export.
+            "remotes": d.get("remotes", []),
         }
     return state, icons
 
@@ -1884,6 +1921,11 @@ def render_egos(state):
         for a in e["apps"]:
             out.append("[[ego.app]]")
             out += [f"{k} = {q(a[k])}" for k in ("name", "url", "key", "icon") if a.get(k)]
+            out.append("")
+        for r in e.get("remotes", []):
+            out.append("[[ego.remote]]")
+            out += [f"{k} = {int(r[k]) if k == 'port' else q(r[k])}"
+                    for k in REMOTE_KEYS if r.get(k) not in (None, "")]
             out.append("")
     return "\n".join(out)
 
@@ -2018,6 +2060,7 @@ def apply_repo(prune=False):
                     and not (cur and filecmp.cmp(src, cur, shallow=False)):
                 icon_from_repo(a["icon"], want["icon"], egos[slug])
                 done.append(f"new icon for {a['name']}")
+    write_remote_entries()
     subprocess.run(["update-desktop-database", str(DESKTOP_DIR)], capture_output=True)
     subprocess.run(["gtk-update-icon-cache",
                     str(Path.home() / ".local/share/icons/hicolor")],
@@ -2029,6 +2072,451 @@ def available_egos():
     """Egos the repo declares that this device has not set up."""
     here = profiles()
     return {k: e for k, e in load_declared().items() if k not in here}
+
+
+# ---- Remotes: herdr sessions, TUIs and gateways on your tailnet ------------
+# A remote is one thing running on one machine - a herdr session, any TUI, a
+# web gateway - pinned to one ego. Separate things stay separate: two herdr
+# sessions are two remotes, never one session for everything. A remote lives
+# only in egos.toml, so it syncs, and every machine opens it its own way:
+# directly on the machine it runs on, over ssh from any other, and a gateway
+# through that machine's Tailscale serve URL or, failing that, an ssh tunnel.
+
+REMOTE_KINDS = ("herdr", "tui", "web")
+REMOTE_KEYS = ("name", "kind", "machine", "ssh", "session", "command",
+               "port", "path", "url", "icon")
+# Gateways worth offering when a machine answers on their default port.
+GATEWAYS = {18789: "OpenClaw", 9119: "Hermes"}
+# Their terminal UIs: run on the gateway's machine, they talk to it directly.
+AGENT_TUIS = {18789: "openclaw tui", 9119: "hermes --tui"}
+REMOTE_PREFIX = "omaego-remote-"
+SERVE_CACHE = Path.home() / ".cache/omaego/serve.json"
+
+
+def tailnet():
+    """(this machine, {machine: {dns, online, os}}), from Tailscale.
+
+    A machine is its MagicDNS label: two Macs can share a HostName, never a
+    DNS name. Without Tailscale, this machine is its hostname and there are no
+    peers. OMAEGO_MACHINE overrides the name, for a box or a test."""
+    import socket
+    label = lambda n: (n.get("DNSName") or n.get("HostName") or "").split(".")[0].lower()
+    me = os.environ.get("OMAEGO_MACHINE")
+    try:
+        r = subprocess.run(["tailscale", "status", "--json"],
+                           capture_output=True, text=True, timeout=4)
+        d = json.loads(r.stdout)
+    except Exception:
+        d = {}
+    me = me or label(d.get("Self") or {}) or socket.gethostname().split(".")[0].lower()
+    peers = {}
+    for n in (d.get("Peer") or {}).values():
+        if label(n):
+            peers[label(n)] = {"dns": (n.get("DNSName") or "").rstrip("."),
+                               "online": bool(n.get("Online")), "os": n.get("OS", "")}
+    peers[me] = {"dns": ((d.get("Self") or {}).get("DNSName") or "").rstrip("."),
+                 "online": True, "os": "this machine"}
+    return me, peers
+
+
+def remote_id(r):
+    return slugify(r["name"])
+
+
+def remote_owners():
+    """{remote id: [ego slugs it is pinned to]}, from egos.toml."""
+    out = {}
+    for k, r in declared_remotes():
+        out.setdefault(remote_id(r), []).append(k)
+    return out
+
+
+def remote_owner(cls, pinned):
+    """The ego a remote's terminal (class omaego.<ego>.<remote>) belongs to
+    now. The class is fixed when the window opens, so after the remote is
+    pinned to another ego, the pin wins over the class. None if not a remote."""
+    if not cls.startswith(REMOTE_CLASS):
+        return None
+    _, slug, rid = (cls.split(".", 2) + ["", ""])[:3]
+    owners = pinned.get(rid, [])
+    return slug if slug in owners or not owners else (owners[0] if len(owners) == 1 else slug)
+
+
+def remote_label(r):
+    """What the launcher calls it: app first, ego last, the machine with it."""
+    return f"{r['name']} @{r['machine']}"
+
+
+def declared_remotes(slug=None):
+    """(slug, remote) for every declared remote, or one ego's."""
+    return [(k, r) for k, e in load_declared().items() if slug in (None, k)
+            for r in e.get("remotes", [])]
+
+
+def find_remote(slug, want):
+    want = (want or "").lower()
+    for _, r in declared_remotes(slug):
+        if want in (remote_id(r), r["name"].lower()):
+            return r
+    return None
+
+
+def save_remotes(slug, remotes):
+    """Rewrite one ego's remotes in egos.toml. The file is created from this
+    machine's state first, so a remote can be added before any sync."""
+    if not EGOS_FILE.exists():
+        export_repo(write=True)
+    decl = load_declared()
+    if slug not in decl:
+        e = profiles().get(slug)
+        if not e:
+            return False
+        decl[slug] = {"name": e["name"], "color": ego_color(slug), "apps": []}
+    decl[slug]["remotes"] = remotes
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    EGOS_FILE.write_text(render_egos(decl))
+    return True
+
+
+def serve_urls(status_json, dns):
+    """{local port: https URL} from `tailscale serve status --json`."""
+    try:
+        d = json.loads(status_json or "{}")
+    except Exception:
+        return {}
+    out = {}
+    for hostport, web in (d.get("Web") or {}).items():
+        host, _, sport = hostport.rpartition(":")
+        base = f"https://{host or dns}" + ("" if sport in ("443", "") else f":{sport}")
+        for path, h in (web.get("Handlers") or {}).items():
+            m = re.match(r"https?://(?:127\.0\.0\.1|localhost):(\d+)", h.get("Proxy") or "")
+            if m:
+                out.setdefault(int(m.group(1)), base + (path if path != "/" else ""))
+    return out
+
+
+PROBE = r"""command -v herdr >/dev/null 2>&1 && herdr session list 2>/dev/null | awk 'NR>1 {print "herdr", $1, $2}'
+for p in %s; do curl -s -m 1 -o /dev/null "http://127.0.0.1:$p/" && echo "port $p"; done
+echo "serve $(tailscale serve status --json 2>/dev/null | tr -d '\n')"
+"""
+
+
+def probe_machine(machine, me, target=None):
+    """What one machine offers: herdr sessions, gateways, serve URLs. Runs the
+    probe over ssh in a login shell (herdr is often in ~/.local/bin), or
+    directly on this machine."""
+    script = PROBE % " ".join(str(p) for p in GATEWAYS)
+    if machine == me:
+        cmd = ["sh", "-c", script]
+        inp = None
+    else:
+        cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
+               target or machine, 'exec "${SHELL:-/bin/sh}" -l']
+        inp = script
+    try:
+        out = subprocess.run(cmd, input=inp, capture_output=True, text=True,
+                             timeout=12).stdout
+    except Exception:
+        return None
+    found = {"sessions": [], "ports": [], "serve": {}}
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        if parts[0] == "herdr" and len(parts) == 2:
+            name, *st = parts[1].split()
+            found["sessions"].append((name, st[0] if st else ""))
+        elif parts[0] == "port" and len(parts) == 2 and parts[1].isdigit():
+            found["ports"].append(int(parts[1]))
+        elif parts[0] == "serve":
+            found["serve"] = serve_urls(parts[1] if len(parts) == 2 else "", machine)
+    return found
+
+
+def remember_serve(machine, urls):
+    try:
+        cache = json.loads(SERVE_CACHE.read_text())
+    except Exception:
+        cache = {}
+    cache[machine] = {"at": int(time.time()), "urls": {str(k): v for k, v in urls.items()}}
+    SERVE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    SERVE_CACHE.write_text(json.dumps(cache))
+
+
+def serve_url_for(machine, port, target=None):
+    """The machine's Tailscale serve URL for a local port, if it serves one.
+    Asked over ssh at most once a day per machine."""
+    try:
+        hit = json.loads(SERVE_CACHE.read_text()).get(machine)
+    except Exception:
+        hit = None
+    if not hit or time.time() - hit.get("at", 0) > 86400:
+        found = probe_machine(machine, None, target)
+        if found is None:
+            return (hit or {}).get("urls", {}).get(str(port))
+        remember_serve(machine, found["serve"])
+        return found["serve"].get(port)
+    return hit["urls"].get(str(port))
+
+
+def tunnel_port(machine, port):
+    """A local port fixed per (machine, port): the gateway's origin - and so
+    its stored login - stays the same across tunnels."""
+    import zlib
+    return 20000 + zlib.crc32(f"{machine}:{port}".encode()) % 20000
+
+
+def port_open(port):
+    import socket
+    with socket.socket() as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def ensure_tunnel(target, port, local):
+    """Start the supervised ssh tunnel unless one already listens."""
+    if port_open(local):
+        return True
+    me = os.environ.get("OMAEGO_BIN", shutil.which("omaego") or sys.argv[0])
+    subprocess.Popen([me, "remote", "tunnel", target, str(port), str(local)],
+                     start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(40):
+        if port_open(local):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def run_tunnel(target, port, local, idle_limit=600):
+    """Keep `ssh -L local:127.0.0.1:port target` up, reconnecting with backoff,
+    and stop once nothing has used it for idle_limit seconds."""
+    backoff, idle = 2, 0
+    while idle < idle_limit:
+        p = subprocess.Popen(
+            ["ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
+             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+             "-L", f"127.0.0.1:{local}:127.0.0.1:{port}", target],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        started = time.time()
+        while p.poll() is None and idle < idle_limit:
+            time.sleep(15)
+            r = subprocess.run(["ss", "-Htn", "state", "established",
+                                f"( sport = :{local} )"], capture_output=True, text=True)
+            idle = 0 if r.stdout.strip() else idle + 15
+        if p.poll() is None:
+            p.terminate()
+            p.wait(5)
+            break
+        if time.time() - started > 60:
+            backoff = 2
+        log(f"tunnel {target}:{port} dropped; retry in {backoff}s")
+        time.sleep(backoff)
+        idle += backoff
+        backoff = min(backoff * 2, 30)
+    return 0
+
+
+def remote_command(r, me):
+    """The command a TUI remote runs, before the reconnect wrapper."""
+    target = r.get("ssh") or r["machine"]
+    local = r["machine"] == me
+    if r["kind"] == "herdr":
+        sess = r.get("session") or "default"
+        if local:
+            return ["herdr"] + ([] if sess == "default" else ["--session", sess])
+        return ["herdr", "--remote", target, "--session", sess]
+    # A login shell on both ends: npm, pipx and ~/.local/bin tools are often
+    # only on a login PATH, and an agent's TUI is usually one of them.
+    import shlex
+    cmd = r.get("command") or 'exec "$SHELL" -l'
+    if local:
+        return [os.environ.get("SHELL") or "/bin/bash", "-lc", cmd]
+    return ["ssh", "-t", target, f'exec "${{SHELL:-/bin/sh}}" -lc {shlex.quote(cmd)}']
+
+
+def open_remote(slug, r):
+    """Open one remote here: a TUI in a terminal under the reconnect wrapper,
+    a gateway as a web app of the ego. Returns 0, or 1 after a notification."""
+    me, peers = tailnet()
+    egos = profiles()
+    if slug not in egos:
+        notify(f"{r['name']}: set up the ego {slug} on this device first")
+        return 1
+    machine, target = r["machine"], r.get("ssh") or r["machine"]
+    online = machine == me or peers.get(machine, {}).get("online", True)
+    if r["kind"] in ("herdr", "tui"):
+        wrapper = Path(os.environ.get("OMAEGO_BIN", sys.argv[0])).resolve().parent / "omaego-remote"
+        wrapper = str(wrapper) if wrapper.exists() else (shutil.which("omaego-remote") or "omaego-remote")
+        inner = [wrapper, "--label", f"{r['name']} @{machine}"]
+        if machine != me:
+            inner += ["--machine", target]
+        inner += ["--", *remote_command(r, me)]
+        app_id = f"{REMOTE_CLASS}{slug}.{remote_id(r)}"
+        if shutil.which("omarchy-launch-tui"):
+            cmd = ["omarchy-launch-tui", f"--app-id={app_id}", *inner]
+        else:
+            cmd = ["xdg-terminal-exec", f"--app-id={app_id}", "-e", *inner]
+        subprocess.Popen(cmd, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not online:
+            notify(f"{machine} is offline - {r['name']} connects when it is back")
+        return 0
+    # A gateway.
+    path = r.get("path") or "/"
+    if r.get("url"):
+        url = r["url"]
+    elif machine == me:
+        url = f"http://127.0.0.1:{r['port']}{path}"
+    else:
+        if not online:
+            notify(f"{machine} is offline, so {r['name']} cannot open")
+            return 1
+        url = serve_url_for(machine, int(r["port"]), target)
+        if url:
+            url = url.rstrip("/") + path
+        else:
+            local = tunnel_port(machine, int(r["port"]))
+            if not ensure_tunnel(target, int(r["port"]), local):
+                notify(f"{r['name']}: no tunnel to {machine}:{r['port']} (ssh {target} works?)")
+                return 1
+            url = f"http://127.0.0.1:{local}{path}"
+    webapp = Path(os.environ.get("OMAEGO_BIN", sys.argv[0])).resolve().parent / "omaego-webapp"
+    webapp = str(webapp) if webapp.exists() else (shutil.which("omaego-webapp") or "omaego-webapp")
+    log(f"remote {slug}/{remote_id(r)}: {url}")
+    subprocess.Popen([webapp, f"--ego={slug}", f"--app={url}"], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return 0
+
+
+# Where a remote's icon comes from: the tool's or gateway's own site. Any
+# other TUI gets the terminal's icon. Each is badged with its ego, as web apps
+# are, so "herdr agents" for two egos tells itself apart in the launcher.
+REMOTE_ICON_SITES = {"herdr": "https://herdr.dev",
+                     "web:18789": "https://openclaw.ai",
+                     "web:9119": "https://hermes-agent.nousresearch.com"}
+
+
+def terminal_icon(dest):
+    """The default terminal's own icon, as a PNG at dest."""
+    lst = Path.home() / ".config/xdg-terminals.list"
+    ids = [l.strip() for l in (lst.read_text().splitlines() if lst.exists() else [])
+           if l.strip() and not l.startswith("#")]
+    for did in ids + ["com.mitchellh.ghostty.desktop", "Alacritty.desktop", "kitty.desktop"]:
+        for d in (DESKTOP_DIR, Path("/usr/share/applications")):
+            f = d / did
+            m = re.search(r"^Icon=(.+)$", f.read_text(), re.M) if f.exists() else None
+            if not m:
+                continue
+            name = m.group(1).strip()
+            for size in ("256x256", "512x512", "128x128", "scalable"):
+                for ext in ("png", "svg"):
+                    src = Path("/usr/share/icons/hicolor") / size / "apps" / f"{name}.{ext}"
+                    if src.exists() and obtain_icon(str(src), dest):
+                        return True
+    return False
+
+
+def remote_base_icon(r, me):
+    """The unbadged icon for a remote, fetched once and cached. Or None."""
+    word = (r.get("command") or "").split()[:1]
+    agent = next((f"web:{p}" for p, c in AGENT_TUIS.items() if word == c.split()[:1]), None)
+    key = "herdr" if r["kind"] == "herdr" or word == ["herdr"] else \
+          (agent or "tui") if r["kind"] == "tui" else f"web:{r.get('port')}"
+    dest = CACHE / "remote-icons" / f"{key.replace(':', '-')}.png"
+    if r.get("icon"):
+        dest = CACHE / "remote-icons" / f"custom-{slugify(r['icon'])[:40]}.png"
+        return dest if dest.exists() or obtain_icon(r["icon"], dest) else None
+    if dest.exists():
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if key == "tui":
+        ok = terminal_icon(dest)
+    elif key in REMOTE_ICON_SITES:
+        ok = site_icon(REMOTE_ICON_SITES[key], dest)
+    elif r["kind"] == "web" and r["machine"] == me and r.get("port"):
+        ok = site_icon(f"http://127.0.0.1:{r['port']}/", dest)
+    else:
+        ok = False
+    if ok:
+        round_tile(dest)
+    return dest if ok else None
+
+
+def round_tile(path):
+    """Round the corners of an icon that is an opaque square (herdr's is): a
+    hard-edged tile looks broken next to the launcher's other icons."""
+    corner = subprocess.run(["magick", str(path), "-format", "%[fx:p{0,0}.a]", "info:"],
+                            capture_output=True, text=True).stdout.strip()
+    if corner not in ("1", "1.0"):
+        return
+    subprocess.run(["magick", str(path), "-alpha", "set",
+                    "(", "+clone", "-alpha", "transparent", "-fill", "white",
+                    "-draw", "roundrectangle 0,0 %[fx:w-1],%[fx:h-1] 44,44", ")",
+                    "-compose", "DstIn", "-composite", f"PNG32:{path}"], capture_output=True)
+
+
+def remote_icon_slug(slug, r):
+    return f"{REMOTE_PREFIX}{slug}-{remote_id(r)}"
+
+
+def write_remote_entries():
+    """A launcher entry per remote of every ego set up here; stale ones go.
+
+    Named like a web app - "herdr agents Work", app first, ego last. The
+    machine is in the comment and the keywords, so typing it still finds the
+    entry, and on the egocard as its tag."""
+    me_bin = os.environ.get("OMAEGO_BIN", str(Path.home() / ".local/bin/omaego"))
+    me = tailnet()[0] if declared_remotes() else None
+    egos = profiles()
+    want = {}
+    for slug, r in declared_remotes():
+        if slug not in egos:
+            continue
+        name = APP_NAME_TEMPLATE.format(app=r["name"], ego=egos[slug]["name"])
+        what = {"herdr": f"herdr session {r.get('session') or 'default'}",
+                "tui": r.get("command") or "shell",
+                "web": f"gateway on port {r.get('port')}"}[r["kind"]]
+        icon_slug = remote_icon_slug(slug, r)
+        base = remote_base_icon(r, me)
+        badged = ICON_DIR / f"{icon_slug}.png"
+        orig = ICON_DIR / f"{icon_slug}.orig.png"
+        if base:
+            ICON_DIR.mkdir(parents=True, exist_ok=True)
+            import filecmp
+            if not orig.exists() or not filecmp.cmp(base, orig, shallow=False) \
+                    or not badged.exists():
+                shutil.copy(base, orig)
+                apply_badge(icon_slug, egos[slug])
+            icon = icon_slug
+        else:
+            icon = "web-browser" if r["kind"] == "web" else "utilities-terminal"
+        want[f"{icon_slug}.desktop"] = (icon_slug, egos[slug], f"""[Desktop Entry]
+Type=Application
+Name={name}
+Comment={what} on {r['machine']}, as {egos[slug]['name']}
+Keywords={r['machine']};{r['kind']};{egos[slug]['name']};
+Exec={me_bin} remote open {slug} {remote_id(r)}
+Icon={icon}
+Terminal=false
+Categories=Network;
+X-Omaego-Remote={slug}/{remote_id(r)}
+""")
+    DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
+    for f in DESKTOP_DIR.glob(f"{REMOTE_PREFIX}*.desktop"):
+        if f.name not in want:
+            f.unlink()
+            for ic in (ICON_DIR / f"{f.stem}.png", ICON_DIR / f"{f.stem}.orig.png"):
+                ic.unlink(missing_ok=True)
+    for fname, (icon_slug, ego, text) in want.items():
+        f = DESKTOP_DIR / fname
+        if not f.exists() or f.read_text() != text:
+            f.write_text(text)
+            # The name or ego changed: the badge may have too.
+            if (ICON_DIR / f"{icon_slug}.orig.png").exists():
+                apply_badge(icon_slug, ego)
+    subprocess.run(["gtk-update-icon-cache", str(Path.home() / ".local/share/icons/hicolor")],
+                   capture_output=True)
 
 
 GITIGNORE = "# per device, never synced\nengine\n"
@@ -2284,6 +2772,18 @@ opens on the workspace you are on - never by switching desktops.
   omaego sync --status [--fetch] [--json]   drift between repo and machine
   omaego apply [--prune] make this machine match egos.toml
   omaego app open <ego> "<app>"   launch, installing a declared app first
+  omaego move ego <slug> --before <slug> | --end
+  omaego move app <ego> <url> --before <url> | --end
+  omaego move remote <ego> <name> --before <name> | --end
+                         reorder in egos.toml (what dragging on the panel does)
+  omaego remote machines this machine and your tailnet's
+  omaego remote add <ego> herdr <machine> [session]
+  omaego remote add <ego> web <machine> <port> [--path /x] [--url <url>]
+  omaego remote add <ego> tui <machine> --name <n> -- <command>
+                         pin a herdr session, a gateway or any TUI on a machine
+                         to an ego (--ssh user@host, --icon, --open)
+  omaego remote list|open|remove <ego> <name>    pinned sessions and gateways
+  omaego remote pick <ego>        choose from what your machines offer
   omaego rule list       the routing rules
   omaego rule add <url-glob> <ego> [--app]
   omaego app list        web apps you can pin to an ego
@@ -2328,7 +2828,9 @@ def main(argv):
 
     # Callers probe browsers with --help (omarchy-launch-browser greps it to
     # detect Firefox); never treat a flag as a URL.
-    if any(a in ("--help", "-h", "-help") for a in argv):
+    # (Only before "--": what follows is a remote TUI's own command line.)
+    if any(a in ("--help", "-h", "-help")
+           for a in (argv[:argv.index("--")] if "--" in argv else argv)):
         print(USAGE)
         return 0
 
@@ -2414,6 +2916,9 @@ def main(argv):
             print(f"ego {slugify(name)!r} already exists", file=sys.stderr)
             return 1
         slug = add_profile(name, eng, existing_arg)
+        # An ego adopted from the repo brings its pinned remotes: their
+        # launcher entries come with it, not with the next sync.
+        write_remote_entries()
         if "--open" in sys.argv:
             # From the panel's "Set up here": open it, so signing in comes first.
             ego = profiles()[slug]
@@ -2915,6 +3420,250 @@ def main(argv):
         print(f"unknown: omaego app {sub}", file=sys.stderr)
         return 2
 
+    if cmd == "move":
+        # The panel's drag and drop: put one ego, app or remote in front of
+        # another (--before) or last (--end), in egos.toml - so it syncs.
+        #   omaego move ego <slug> --before <slug> | --end
+        #   omaego move app <ego> <url> --before <url> | --end
+        #   omaego move remote <ego> <name> --before <name> | --end
+        raw = sys.argv[sys.argv.index("move") + 1:]
+        before = next((raw[i + 1] for i, a in enumerate(raw)
+                       if a == "--before" and i + 1 < len(raw)), None)
+        pos = [a for a in raw if not a.startswith("--") and a != before]
+        kind = pos[0] if pos else ""
+        if kind not in ("ego", "app", "remote") or len(pos) < (2 if kind == "ego" else 3) \
+                or not (before or "--end" in raw):
+            print("usage: omaego move ego <slug> --before <slug> | --end\n"
+                  "       omaego move app <ego> <url> --before <url> | --end\n"
+                  "       omaego move remote <ego> <name> --before <name> | --end",
+                  file=sys.stderr)
+            return 2
+        # This machine's egos and apps into the file first, so everything the
+        # card shows is in the list being reordered.
+        export_repo(write=True)
+        decl = load_declared()
+
+        def reorder(items, ident, what, anchor):
+            i = next((n for n, x in enumerate(items) if ident(x) == what), None)
+            if i is None:
+                return None
+            item = items.pop(i)
+            j = next((n for n, x in enumerate(items) if ident(x) == anchor), len(items))
+            items.insert(j, item)
+            return items
+
+        if kind == "ego":
+            order = reorder(list(decl), lambda k: k, pos[1], before)
+            if order is None:
+                print(f"unknown ego {pos[1]!r}", file=sys.stderr)
+                return 1
+            decl = {k: decl[k] for k in order}
+        else:
+            slug, what = pos[1], pos[2]
+            if slug not in decl:
+                print(f"unknown ego {slug!r}", file=sys.stderr)
+                return 1
+            field = "apps" if kind == "app" else "remotes"
+            ident = (lambda a: a["url"]) if kind == "app" else remote_id
+            if kind == "remote":
+                what = slugify(what)
+                before = slugify(before) if before else None
+            if reorder(decl[slug][field], ident, what, before) is None:
+                print(f"no {kind} {pos[2]!r} in {slug}", file=sys.stderr)
+                return 1
+        EGOS_FILE.write_text(render_egos(decl))
+        print("moved")
+        return 0
+
+    if cmd == "remote":
+        # Parsed from sys.argv: main() drops flags but keeps their values, and
+        # a TUI's command after "--" must arrive untouched.
+        raw = sys.argv[sys.argv.index("remote") + 1:]
+        command = None
+        if "--" in raw:
+            command = " ".join(raw[raw.index("--") + 1:])
+            raw = raw[:raw.index("--")]
+        VALUED = ("--name", "--path", "--url", "--ssh", "--icon")
+        opts, pos, i = {}, [], 0
+        while i < len(raw):
+            if raw[i] in VALUED and i + 1 < len(raw):
+                opts[raw[i][2:]] = raw[i + 1]
+                i += 2
+                continue
+            if not raw[i].startswith("-"):
+                pos.append(raw[i])
+            i += 1
+        sub = pos[0] if pos else "list"
+        rest = pos[1:]
+
+        if sub == "tunnel":
+            # Internal: the supervised tunnel `remote open` starts for a gateway.
+            target, port, local = rest[0], int(rest[1]), int(rest[2])
+            return run_tunnel(target, port, local)
+
+        if sub in ("list", "ls"):
+            me, peers = tailnet()
+            rows = [{"ego": k, "id": remote_id(r), **r,
+                     "here": r["machine"] == me,
+                     "online": r["machine"] == me or peers.get(r["machine"], {}).get("online", False)}
+                    for k, r in declared_remotes()]
+            if want_json:
+                print(json.dumps({"machine": me, "remotes": rows}))
+                return 0
+            print(f"this machine: {me}")
+            for x in rows:
+                what = {"herdr": f"herdr {x.get('session') or 'default'}",
+                        "tui": x.get("command") or "shell",
+                        "web": x.get("url") or f":{x.get('port')}{x.get('path') or ''}"}[x["kind"]]
+                state = "here" if x["here"] else ("online" if x["online"] else "offline")
+                print(f"  {x['ego']:<12} {x['name']:<24} {x['machine']:<16} {what}  ({state})")
+            return 0
+
+        if sub == "machines":
+            me, peers = tailnet()
+            for m, p in sorted(peers.items()):
+                print(f"{m:<24} {'this machine' if m == me else ('online' if p['online'] else 'offline'):<13} {p['os']}")
+            return 0
+
+        if sub == "add":
+            # remote add <ego> herdr <machine> [session]
+            # remote add <ego> web <machine> <port> [--path P] [--url U]
+            # remote add <ego> tui <machine> -- <command>
+            pos = rest
+            if len(pos) < 3 or pos[1] not in REMOTE_KINDS:
+                print("usage: omaego remote add <ego> herdr <machine> [session]\n"
+                      "       omaego remote add <ego> web <machine> <port> [--path /x] [--url URL]\n"
+                      "       omaego remote add <ego> tui <machine> --name N -- <command>\n"
+                      "  options: --name N, --ssh user@host, --icon NAME", file=sys.stderr)
+                return 2
+            slug, kind, machine = pos[0], pos[1], pos[2].lower()
+            if slug not in profiles() and slug not in load_declared():
+                print(f"unknown ego {slug!r} (see: omaego list)", file=sys.stderr)
+                return 1
+            r = {"kind": kind, "machine": machine}
+            if kind == "herdr":
+                r["session"] = pos[3] if len(pos) > 3 else "default"
+                r["name"] = opts.get("name") or ("herdr" if r["session"] == "default"
+                                              else f"herdr {r['session']}")
+            elif kind == "web":
+                if len(pos) < 4 or not pos[3].isdigit():
+                    print("web needs a port: omaego remote add <ego> web <machine> <port>",
+                          file=sys.stderr)
+                    return 2
+                r["port"] = int(pos[3])
+                r["name"] = opts.get("name") or GATEWAYS.get(r["port"], f"Gateway {r['port']}")
+            else:
+                if not command:
+                    print("tui needs a command after --", file=sys.stderr)
+                    return 2
+                r["command"] = command
+                agent = next((GATEWAYS[p] for p, c in AGENT_TUIS.items()
+                              if command.split()[:1] == c.split()[:1]), None)
+                r["name"] = opts.get("name") or (f"{agent} TUI" if agent else command.split()[0])
+            for k in ("path", "url", "ssh", "icon"):
+                if opts.get(k):
+                    r[k] = opts[k]
+            remotes = [x for _, x in declared_remotes(slug)]
+            if any(remote_id(x) == remote_id(r) for x in remotes):
+                print(f"{slug} already has a remote called {r['name']!r}; pick another --name",
+                      file=sys.stderr)
+                return 1
+            if not save_remotes(slug, remotes + [r]):
+                return 1
+            write_remote_entries()
+            subprocess.run(["update-desktop-database", str(DESKTOP_DIR)], capture_output=True)
+            print(f"added {remote_label(r)} to {slug}")
+            if "--open" in sys.argv:
+                return open_remote(slug, r)
+            return 0
+
+        if sub in ("remove", "rm"):
+            if len(rest) < 2:
+                print("usage: omaego remote remove <ego> <name>", file=sys.stderr)
+                return 2
+            r = find_remote(rest[0], rest[1])
+            if not r:
+                print(f"no remote {rest[1]!r} in {rest[0]}", file=sys.stderr)
+                return 1
+            save_remotes(rest[0], [x for _, x in declared_remotes(rest[0]) if x != r])
+            write_remote_entries()
+            subprocess.run(["update-desktop-database", str(DESKTOP_DIR)], capture_output=True)
+            notify(f"removed {remote_label(r)}")
+            print(f"removed {remote_label(r)}")
+            return 0
+
+        if sub == "open":
+            if len(rest) < 2:
+                print("usage: omaego remote open <ego> <name>", file=sys.stderr)
+                return 2
+            r = find_remote(rest[0], rest[1])
+            if not r:
+                notify(f"no remote {rest[1]} in {rest[0]}")
+                return 1
+            return open_remote(rest[0], r)
+
+        if sub == "pick":
+            # The card's "Add session or gateway": what your machines offer -
+            # their herdr sessions (shown by name) and gateways - in one search.
+            if not rest:
+                print("usage: omaego remote pick <ego>", file=sys.stderr)
+                return 2
+            slug = rest[0]
+            me, peers = tailnet()
+            notify("looking at your machines…")
+            from concurrent.futures import ThreadPoolExecutor
+            cands = [m for m, p in peers.items()
+                     if m == me or (p["online"] and p["os"] in ("linux", "macOS"))]
+            with ThreadPoolExecutor(8) as ex:
+                found = dict(zip(cands, ex.map(lambda m: probe_machine(m, me), cands)))
+            have = {(r["machine"], r["kind"], r.get("session"), r.get("port"))
+                    for _, r in declared_remotes()}
+            rows = {}
+            for m in sorted(found, key=lambda x: (x != me, x)):
+                f = found[m]
+                if not f:
+                    continue
+                remember_serve(m, f["serve"])
+                for sess, st in f["sessions"]:
+                    if (m, "herdr", sess, None) in have:
+                        continue
+                    label = f"{m}: {sess}" + (" (stopped)" if st == "stopped" else "")
+                    rows[label] = ["herdr", m, sess]
+                for port in f["ports"]:
+                    label = GATEWAYS.get(port, f"gateway :{port}")
+                    if (m, "web", None, port) not in have:
+                        rows[f"{m}: {label} web"] = ["web", m, str(port)]
+                    if port in AGENT_TUIS:
+                        rows[f"{m}: {label} TUI"] = ["agent-tui", m, AGENT_TUIS[port]]
+                rows[f"{m}: new session…"] = ["herdr-new", m]
+            rows["Any TUI over ssh…"] = ["tui-new"]
+            spec = pick(list(rows.items()), f"Pin to {(profiles().get(slug) or {}).get('name', slug)}",
+                        single=False)
+            if not spec:
+                return 0
+            if spec[0] == "herdr-new":
+                sess = (prompt_text(f"Name of the new herdr session on {spec[1]}") or "").strip()
+                if not sess:
+                    return 0
+                spec = ["herdr", spec[1], slugify(sess)]
+            elif spec[0] == "agent-tui":
+                me_bin = os.environ.get("OMAEGO_BIN", sys.argv[0])
+                return subprocess.run([me_bin, "remote", "add", slug, "tui", spec[1],
+                                       "--open", "--", spec[2]]).returncode
+            elif spec[0] == "tui-new":
+                txt = (prompt_text("machine: command, e.g. lco-box: btop") or "").strip()
+                if ":" not in txt:
+                    return 0
+                m, command = (x.strip() for x in txt.split(":", 1))
+                me_bin = os.environ.get("OMAEGO_BIN", sys.argv[0])
+                return subprocess.run([me_bin, "remote", "add", slug, "tui", m.lower(),
+                                       "--open", "--", command]).returncode
+            me_bin = os.environ.get("OMAEGO_BIN", sys.argv[0])
+            return subprocess.run([me_bin, "remote", "add", slug, *spec, "--open"]).returncode
+
+        print("usage: omaego remote [list|machines|add|remove|open|pick]", file=sys.stderr)
+        return 2
+
     if cmd == "setup":
         # What install.sh does, minus the symlinks: for a packaged install the
         # binaries are already on PATH and only the per-user wiring is missing.
@@ -2991,7 +3740,7 @@ def main(argv):
                 print("  cookies and saved passwords did not - sign in again")
             return 0
         print(f"default: {eng['name']}  ({eng['command']})  - {eng['source']}")
-        for t in sorted(egos.values(), key=lambda t: t["name"]):
+        for t in sorted(egos.values(), key=ego_sort_key()):
             missing = "" if shutil.which(t["engine"]["command"]) else "  NOT INSTALLED"
             print(f"  {t['name']:<22} {t['engine']['name']}{missing}")
         return 0 if shutil.which(eng["command"]) else 1
@@ -3120,6 +3869,7 @@ def main(argv):
         # The local half first, as `sync` always did: desktop entries and the
         # native messaging links. It is what a package upgrade asks for.
         write_desktop_entries()
+        write_remote_entries()
         print("desktop entries written")
         if not (CONFIG_DIR / ".git").exists():
             if not url:
@@ -3215,13 +3965,27 @@ def main(argv):
         rules = [{"pattern": r.get("url") or r.get("match") or "",
                   "profile": r.get("profile"), "app": bool(r.get("app"))}
                  for r in load_rules()]
-        egos = sorted(profiles().values(), key=lambda t: t["name"])
+        egos = sorted(profiles().values(), key=ego_sort_key())
         names = {t["name"].lower() for t in egos} | {t["slug"] for t in egos}
         declared = load_declared()
         avail = available_egos()
+        me, peers = tailnet() if any(e.get("remotes") for e in declared.values()) else (None, {})
+
+        def panel_remote(r, t_slug):
+            here = r["machine"] == me
+            return {"id": remote_id(r), "name": r["name"], "kind": r["kind"],
+                    "iconPath": icon_path(remote_icon_slug(t_slug, r)),
+                    "machine": r["machine"], "here": here,
+                    "online": here or peers.get(r["machine"], {}).get("online", False)}
         # A rule for an ego in your repo but not on this device belongs on that
         # ego's card, not among the rules for no ego at all.
         names |= {e["name"].lower() for e in avail.values()} | set(avail)
+
+        def app_rank(slug):
+            # Apps in egos.toml's order (drag on the card to change it); any
+            # it does not list yet after them, by name.
+            rank = {a["url"]: i for i, a in enumerate(declared.get(slug, {}).get("apps", []))}
+            return lambda a: (rank.get(a["url"], len(rank)), (a.get("short") or a["name"]).lower())
 
         def panel_app(a, ego_name):
             # "Outlook Work" is the launcher's name; inside the Work column the
@@ -3243,7 +4007,8 @@ def main(argv):
                       "browser": t["engine"]["short"],
                       "here": t["wm_class"] in here,
                       "focused": t["wm_class"] == focused_cls,
-                      "apps": [panel_app(a, t["name"]) for a in inst.get(t["slug"], [])]
+                      "apps": sorted(
+                              [panel_app(a, t["name"]) for a in inst.get(t["slug"], [])]
                               + [{"name": APP_NAME_TEMPLATE.format(app=a["name"], ego=t["name"]),
                                   "short": a["name"], "url": a["url"], "pending": True,
                                   "iconPath": str(CONFIG_DIR / a["icon"]) if a.get("icon")
@@ -3251,8 +4016,12 @@ def main(argv):
                                   "desktop": "", "exec": ""}
                                  for a in declared.get(t["slug"], {}).get("apps", [])
                                  if a["url"] not in {x["url"] for x in inst.get(t["slug"], [])}],
+                              key=app_rank(t["slug"])),
+                      "remotes": [panel_remote(r, t["slug"]) for r in
+                                  declared.get(t["slug"], {}).get("remotes", [])],
                       "rules": [r for r in rules if owns(t, r)]}
                      for t in egos],
+            "machine": me,
             # Rules with no ego (rewrite/app-only) or naming one that is gone.
             "looseRules": [r for r in rules
                            if (r["profile"] or "").lower() not in names],
@@ -3263,7 +4032,8 @@ def main(argv):
                            "apps": [a["name"] for a in e["apps"]],
                            "rules": [r for r in rules
                                      if (r["profile"] or "").lower() in (k, e["name"].lower())]}
-                          for k, e in sorted(avail.items(), key=lambda kv: kv[1]["name"])],
+                          for k, e in sorted(avail.items(),
+                                             key=lambda kv, o=ego_sort_key(): o((kv[0], kv[1]["name"])))],
         }))
         return 0
 

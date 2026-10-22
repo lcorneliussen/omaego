@@ -33,6 +33,7 @@ mkdir -p "$BIN" "$APPS" "$CFG"
 echo "binaries:"
 link "$REPO/bin/omaego"        "$BIN/omaego"
 link "$REPO/bin/omaego-webapp" "$BIN/omaego-webapp"
+link "$REPO/bin/omaego-remote" "$BIN/omaego-remote"
 # Compatibility shims for installs that predate the rename, off by default so a
 # fresh install leaves nothing duplicated. omaego-webapp accepts --profile= as
 # well as --ego= either way, so existing launchers keep working once repointed.
