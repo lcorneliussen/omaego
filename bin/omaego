@@ -239,6 +239,94 @@ def ensure_native_hosts(data_dir, eng=None):
     return n
 
 
+# Arch's Chromium ships without Google API keys, so it cannot sign in to a
+# Google account. Omarchy has the fix - Chrome's own OAuth client, appended to
+# ~/.config/chromium-flags.conf - and the Chromium binary reads that file on
+# every launch, so it is one switch per device, not per ego. On by default;
+# `omaego setup --no-google-signin` turns it off, remembered beside the egos so
+# the next Chromium ego does not quietly turn it back on.
+GOOGLE_SIGNIN_SCRIPT = "omarchy-install-chromium-google-account"
+CHROMIUM_FLAGS = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) \
+    / "chromium-flags.conf"
+GOOGLE_SIGNIN_FLAGS = ("--oauth2-client-id=", "--oauth2-client-secret=")
+NO_GOOGLE_SIGNIN = EGO_ROOT / ".no-google-signin"
+
+
+def google_signin(eng, want=None):
+    """Let Chromium sign in to Google accounts, or (want=False) stop it.
+
+    want=None is the default: on, unless this device turned it off. Returns a
+    line saying how things stand, or None when the engine is not Chromium.
+    """
+    if eng["id"] != "chromium.desktop":
+        return None
+    try:
+        lines = CHROMIUM_FLAGS.read_text().splitlines(keepends=True)
+    except OSError:
+        lines = []
+    has = any(l.startswith(GOOGLE_SIGNIN_FLAGS) for l in lines)
+    if want is False:
+        EGO_ROOT.mkdir(parents=True, exist_ok=True)
+        NO_GOOGLE_SIGNIN.touch()
+        if has:
+            CHROMIUM_FLAGS.write_text("".join(l for l in lines
+                                              if not l.startswith(GOOGLE_SIGNIN_FLAGS)))
+            return f"google: off, removed Chrome's OAuth client from {CHROMIUM_FLAGS}"
+        return "google: off on this device"
+    if want is None and NO_GOOGLE_SIGNIN.exists():
+        return "google: off on this device (omaego setup --google-signin turns it on)"
+    NO_GOOGLE_SIGNIN.unlink(missing_ok=True)
+    if has:
+        return "google: Chromium can sign in to Google accounts"
+    if not shutil.which(GOOGLE_SIGNIN_SCRIPT):
+        return (f"google: Chromium cannot sign in to Google accounts, and there is "
+                f"no {GOOGLE_SIGNIN_SCRIPT} to fix that")
+    # The script only appends to a flags file that is already there.
+    CHROMIUM_FLAGS.parent.mkdir(parents=True, exist_ok=True)
+    CHROMIUM_FLAGS.touch()
+    subprocess.run([GOOGLE_SIGNIN_SCRIPT], capture_output=True, timeout=30)
+    if any(l.startswith(GOOGLE_SIGNIN_FLAGS)
+           for l in CHROMIUM_FLAGS.read_text().splitlines()):
+        return ("google: Chromium can now sign in to Google accounts "
+                "(restart a running Chromium once)")
+    return f"google: {GOOGLE_SIGNIN_SCRIPT} ran, but {CHROMIUM_FLAGS} has no OAuth client"
+
+
+def preferences(ego):
+    """An ego's browser Preferences, or {} when it has none yet."""
+    try:
+        return json.loads((ego["data_dir"] / ego.get("profile_dir", "Default")
+                           / "Preferences").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def signin_blocked(ego):
+    """True when the profile itself has browser sign-in switched off - a saved
+    setting that outlives the OAuth flags, so only the browser can undo it."""
+    return preferences(ego).get("signin", {}).get("allowed") is False
+
+
+def browser_accounts(ego):
+    """The Google accounts an ego's browser is signed in to. OMAEGO_NO_ACCOUNTS=1
+    stops omaego from reading them, so egos.toml only has the ones you add."""
+    if os.environ.get("OMAEGO_NO_ACCOUNTS") == "1":
+        return []
+    return [a["email"] for a in preferences(ego).get("account_info", [])
+            if isinstance(a, dict) and "@" in (a.get("email") or "")]
+
+
+def merge_accounts(*lists):
+    """One list of addresses, first spelling and order kept, case-insensitive."""
+    out, seen = [], set()
+    for l in lists:
+        for a in l or []:
+            if a.lower() not in seen:
+                seen.add(a.lower())
+                out.append(a)
+    return out
+
+
 def default_slug():
     """Profile that acts as plain 'Chrome': the launcher entry and web apps."""
     try:
@@ -384,6 +472,7 @@ def set_engine(slug, eng, profile="keep"):
         if stale.is_symlink():
             stale.unlink()
     (d / ".engine").write_text(eng["id"] + "\n")
+    google_signin(eng)
     ensure_native_hosts(d, eng)
     write_desktop_entries()
     return backup
@@ -504,6 +593,7 @@ def add_profile(name, eng=None, existing=False):
     (d / ".engine").write_text(eng["id"] + "\n")
     if mine and decl[mine].get("color"):
         (d / ".ego-color").write_text(decl[mine]["color"] + "\n")
+    google_signin(eng)
     ensure_native_hosts(d)
     write_desktop_entries()
     return slug
@@ -1818,7 +1908,7 @@ def short_name(name, ego_name):
 
 
 def load_declared():
-    """egos.toml as slug -> {name, color, apps, remotes}. Empty when absent."""
+    """egos.toml as slug -> {name, color, accounts, apps, remotes}. Empty when absent."""
     try:
         data = tomllib.loads(EGOS_FILE.read_text())
     except FileNotFoundError:
@@ -1833,6 +1923,10 @@ def load_declared():
             out[e["slug"]] = {
                 "name": e.get("name") or e["slug"].title(),
                 "color": (e.get("color") or "").lstrip("#") or None,
+                # Optional: the addresses this ego signs in with, so a device
+                # setting it up knows which account belongs in it.
+                "accounts": merge_accounts([a for a in e.get("accounts", [])
+                                            if isinstance(a, str) and "@" in a]),
                 "apps": [a for a in e.get("app", []) if a.get("url") and a.get("name")],
                 "remotes": [r for r in e.get("remote", [])
                             if r.get("name") and r.get("machine")
@@ -1900,6 +1994,11 @@ def repo_state():
         state[slug] = {
             "name": name,
             "color": ego_color(slug) if here else d.get("color"),
+            # Kept from the file and added to from the browser, never dropped
+            # because this device is signed out: removing one is `omaego account
+            # remove`, on purpose.
+            "accounts": merge_accounts(d.get("accounts"),
+                                       browser_accounts(egos[slug]) if here else []),
             "apps": sorted(apps.values(),
                            key=lambda x: (rank.get(x["url"], len(rank)), x["name"].lower())),
             # Remotes exist only as declarations: nothing on disk to export.
@@ -1917,6 +2016,8 @@ def render_egos(state):
         out += ["[[ego]]", f"slug = {q(slug)}", f"name = {q(e['name'])}"]
         if e.get("color"):
             out.append(f"color = {q(e['color'])}")
+        if e.get("accounts"):
+            out.append(f"accounts = {q(e['accounts'])}")   # and a JSON array a TOML one
         out.append("")
         for a in e["apps"]:
             out.append("[[ego.app]]")
@@ -1976,6 +2077,22 @@ def forget_declared(slug, url):
         for a in apps:
             if a["url"] == url and a.get("icon"):
                 (CONFIG_DIR / a["icon"]).unlink(missing_ok=True)
+
+
+def set_accounts(slug, add=(), remove=()):
+    """Add or drop accounts on one ego in egos.toml. An ego the file does not
+    list yet gets an entry of its own; the next sync fills in its apps."""
+    decl = load_declared()
+    if slug not in decl:
+        ego = profiles()[slug]
+        decl[slug] = {"name": ego["name"], "color": ego_color(slug),
+                      "accounts": [], "apps": []}
+    drop = {a.lower() for a in remove}
+    decl[slug]["accounts"] = [a for a in merge_accounts(decl[slug]["accounts"], add)
+                              if a.lower() not in drop]
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    EGOS_FILE.write_text(render_egos(decl))   # the file's order, which is yours
+    return decl[slug]["accounts"]
 
 
 def icon_from_repo(icon_slug, repo_rel, ego):
@@ -2795,6 +2912,11 @@ opens on the workspace you are on - never by switching desktops.
   omaego app icon <ego> "<app name>" <image url|path|--agent>
   omaego app rebadge [ego]        stamp ego badges on installed app icons
   omaego launch <slug> [url]
+  omaego account [<ego>] the accounts each ego signs in with (optional): Google
+                         ones are read from the browser, unless
+                         OMAEGO_NO_ACCOUNTS=1
+  omaego account add|remove <ego> <email>...
+                         note one by hand (a Microsoft account, say), or drop it
   omaego engine          the browser each ego runs in. A new ego gets omarchy's
                          default browser; after `omarchy default browser <x>`,
                          run `omaego setup` to put omaego back in front of it
@@ -2808,7 +2930,9 @@ opens on the workspace you are on - never by switching desktops.
   omaego close <ego>     close that ego's windows on this workspace
   omaego space [--json]  which ego owns the current workspace
   omaego here [--json]   browser and web-app windows on the current workspace
-  omaego setup           first-run wiring: handler, desktop entries, rules file
+  omaego setup [--no-google-signin | --google-signin]
+                         first-run wiring: handler, desktop entries, rules file,
+                         and Google sign-in for Chromium (on unless turned off)
   omaego restructure     name each inner profile dir after its ego, so web-app
                          windows identify their ego (rarely needed)
 
@@ -2858,10 +2982,16 @@ def main(argv):
                 for t in sorted(by_class.values(),
                                 key=lambda t: (not t["managed"], t["name"]))]))
             return 0
+        declared = load_declared()
         for t in sorted(by_class.values(), key=lambda t: (not t["managed"], t["name"])):
             kind = "routable" if t["managed"] else "shared data dir"
             print(f"{t['name']:<24} {t['engine']['short']:<9} "
                   f"class={t['wm_class']:<22} {kind}")
+            if t["managed"]:
+                accts = merge_accounts(declared.get(t["slug"], {}).get("accounts"),
+                                       browser_accounts(t))
+                if accts:
+                    print(f"    as {', '.join(accts)}")
             if not t["managed"] and t["data_dir"]:
                 inner = internal_profiles(t["data_dir"])
                 for sub, nm in inner:
@@ -2919,24 +3049,35 @@ def main(argv):
         # An ego adopted from the repo brings its pinned remotes: their
         # launcher entries come with it, not with the next sync.
         write_remote_entries()
+        # The repo may say which account belongs in this ego.
+        accts = load_declared().get(slug, {}).get("accounts") or []
+        sign_in = f"sign in as {', '.join(accts)}" if accts else "sign in"
         if "--open" in sys.argv:
             # From the panel's "Set up here": open it, so signing in comes first.
             ego = profiles()[slug]
             launch(ego, new_window=True)
-            notify(f"{ego['name']} is set up here, in {ego['engine']['short']} - sign in")
+            notify(f"{ego['name']} is set up here, in {ego['engine']['short']} - {sign_in}")
             return 0
         if existing_arg:
             ego = profiles()[slug]
-            print(f"{name} is now {ego['engine']['short']}'s own profile "
+            print(f"{ego['name']} is now {ego['engine']['short']}'s own profile "
                   f"({ego['data_dir'].resolve()}), nothing copied.")
             print(f"Restart {ego['engine']['short']} once so its windows carry "
                   f"the ego's class.")
+            if signin_blocked(ego):
+                print(f"Its sign-in is switched off: turn on \"Allow "
+                      f"{ego['engine']['short']} sign-in\" under Settings > You and "
+                      f"Google > Sync and Google services.")
+            if accts:
+                print(f"The repo has it as {', '.join(accts)}.")
             return 0
         print(f"created ego {slug!r} ({name})\n")
         print("next:")
         print(f"  1. omaego launch {slug}")
         print("     sign in to Google/Microsoft in the window that opens; this ego")
         print("     syncs to that account and nothing else does")
+        if accts:
+            print(f"     (the repo has it as {', '.join(accts)})")
         print(f"  2. omaego app add {slug} teams outlook      # see: omaego app list")
         print(f"  3. omaego rule add 'https://*.example.com/*' {name}")
         print("     for hosts that must always open as this ego, wherever you are")
@@ -2976,6 +3117,57 @@ def main(argv):
         DEFAULT_MARK.write_text(argv[1] + "\n")
         write_desktop_entries()
         print(f"default profile -> {argv[1]}")
+        return 0
+
+    if cmd == "account":
+        # Optional: an ego works the same without any. They are what a device
+        # setting the ego up is told to sign in with.
+        here, declared = profiles(), load_declared()
+        # Egos in the repo but not on this device count too: noting an account
+        # does not need the ego set up.
+        egos = {**{s: {"name": e["name"]} for s, e in declared.items()}, **here}
+
+        def find(word):
+            w = word.lower()
+            return next((s for s, e in egos.items() if w in (s, e["name"].lower())), None)
+
+        sub = argv[1] if len(argv) > 1 else None
+        if sub in ("add", "remove"):
+            if len(argv) < 4:
+                print(f"usage: omaego account {sub} <ego> <email>...", file=sys.stderr)
+                return 2
+            slug, emails = find(argv[2]), argv[3:]
+            if not slug:
+                print(f"unknown ego {argv[2]!r} (see: omaego list)", file=sys.stderr)
+                return 1
+            bad = [e for e in emails if "@" not in e]
+            if bad:
+                print(f"not an address: {', '.join(bad)}", file=sys.stderr)
+                return 2
+            now = set_accounts(slug, **({"add": emails} if sub == "add" else {"remove": emails}))
+            print(f"{egos[slug]['name']}: {', '.join(now) or 'no accounts'}")
+            signed_in = {a.lower() for a in browser_accounts(here[slug])} if slug in here else set()
+            back = [e for e in emails if sub == "remove" and e.lower() in signed_in]
+            if back:
+                print(f"  {', '.join(back)} is still signed in to the browser, so the "
+                      f"next sync notes it again (OMAEGO_NO_ACCOUNTS=1 stops that)")
+            return 0
+        if sub and not find(sub):
+            print(f"unknown ego {sub!r} (see: omaego list)", file=sys.stderr)
+            return 1
+        order = ego_sort_key()
+        shown = [find(sub)] if sub else sorted(egos, key=lambda s: order((s, egos[s]["name"])))
+        rows = {s: {"declared": declared.get(s, {}).get("accounts") or [],
+                    "browser": browser_accounts(here[s]) if s in here else []} for s in shown}
+        if want_json:
+            print(json.dumps({s: merge_accounts(r["declared"], r["browser"])
+                              for s, r in rows.items()}))
+            return 0
+        for s, r in rows.items():
+            new = [a for a in r["browser"]
+                   if a.lower() not in {d.lower() for d in r["declared"]}]
+            accts = r["declared"] + [f"{a} (signed in, not synced yet)" for a in new]
+            print(f"{egos[s]['name']:<24} {', '.join(accts) or '-'}")
         return 0
 
     if cmd == "restructure":
@@ -3683,6 +3875,19 @@ def main(argv):
             print(f"  {was or 'the default browser'} cannot hold egos "
                   f"(Chromium family only)")
         print(f"  engine: {eng['name']} ({eng['source']})")
+        want = (False if "--no-google-signin" in sys.argv
+                else True if "--google-signin" in sys.argv else None)
+        line = google_signin(eng, want)
+        if line:
+            print(f"  {line}")
+            if not NO_GOOGLE_SIGNIN.exists():
+                for t in profiles().values():
+                    if t["engine"]["id"] == eng["id"] and signin_blocked(t):
+                        print(f"          {t['name']} has sign-in switched off in its "
+                              f"own settings: Settings > You and Google > Sync and "
+                              f"Google services")
+        elif want is not None:
+            print(f"  google: nothing to do in {eng['short']}, only Chromium needs it")
         menu = picker()
         if menu:
             print(f"  menu:   {'Omarchy' if menu == 'omarchy' else 'walker'}")
@@ -4005,6 +4210,8 @@ def main(argv):
                       "color": "#" + ego_color(t["slug"]),
                       "default": t["slug"] == dflt,
                       "browser": t["engine"]["short"],
+                      "accounts": merge_accounts(declared.get(t["slug"], {}).get("accounts"),
+                                                 browser_accounts(t)),
                       "here": t["wm_class"] in here,
                       "focused": t["wm_class"] == focused_cls,
                       "apps": sorted(
@@ -4029,6 +4236,7 @@ def main(argv):
             "sync": sync_status(),
             # Egos in your repo that are not set up on this device.
             "available": [{"slug": k, "name": e["name"], "color": "#" + (e.get("color") or "7aa2f7"),
+                           "accounts": e.get("accounts") or [],
                            "apps": [a["name"] for a in e["apps"]],
                            "rules": [r for r in rules
                                      if (r["profile"] or "").lower() in (k, e["name"].lower())]}
