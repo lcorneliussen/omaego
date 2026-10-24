@@ -200,8 +200,22 @@ UNMANAGED = {e["class"]: (e["short"] if e["class"] != "google-chrome"
 APP_PREFIXES = tuple(sorted({e["app"] for e in ENGINES.values()}))
 # Windows that look like browsers but are somebody else's tool.
 IGNORED_CLASSES = {"chromium-browser"}
-# The terminal of a remote session: omaego.<ego slug>.<remote id>.
-REMOTE_CLASS = "omaego."
+# The terminal of a remote session: TUI.omaego.<ego slug>.<remote id>.
+# Omarchy tags TUI.* windows as terminals, and its SUPER+C / SUPER+V send
+# Ctrl+Insert / Shift+Insert only to those; a class it does not know gets
+# Ctrl+C, which interrupts the program instead of copying.
+REMOTE_CLASS = "TUI.omaego."
+# Windows opened before that are still omaego.<ego>.<remote>.
+REMOTE_CLASSES = (REMOTE_CLASS, "omaego.")
+
+
+def remote_class_parts(cls):
+    """(ego slug, remote id) from a remote's window class, or None."""
+    for prefix in REMOTE_CLASSES:
+        if cls.startswith(prefix):
+            slug, _, rid = cls[len(prefix):].partition(".")
+            return slug, rid
+    return None
 
 
 def is_browser_class(cls):
@@ -659,8 +673,8 @@ def browsers_here():
         cls = c.get("class", "")
         if cls in IGNORED_CLASSES or c.get("workspace", {}).get("id") != ws:
             continue
-        if cls.startswith(REMOTE_CLASS):
-            # A remote's terminal (omaego.<ego>.<remote>): like a web app, it
+        if remote_class_parts(cls):
+            # A remote's terminal (TUI.omaego.<ego>.<remote>): like a web app, it
             # says which ego is on this desktop and is never a link target.
             prof = slug_class.get(remote_owner(cls, pinned))
             if prof:
@@ -735,13 +749,14 @@ NO_MENU = ("omaego has no menu to ask with: neither Omarchy's own "
            "(omarchy-menu-select) nor walker is installed")
 
 
-def pick(options, prompt, free=False, single=True):
+def pick(options, prompt, free=False, single=True, width=None):
     """options: list of (label, value). Returns value, or None.
 
     With free=True, text that matches no row is returned as ("free", text)
     instead of being discarded: walker filters its rows by what you type and,
     when none is left, hands back the typed text on Enter. Esc returns nothing.
     single=False keeps walker from choosing a lone remaining row by itself.
+    width (px) widens the omarchy menu for long rows, which it cuts otherwise.
     """
     if not options:
         return None
@@ -757,7 +772,8 @@ def pick(options, prompt, free=False, single=True):
     try:
         if picker() == "omarchy":
             r = subprocess.run(
-                ["omarchy-menu-select", prompt, *(label for label, _ in options)],
+                ["omarchy-menu-select", prompt, *(label for label, _ in options),
+                 *(["--", "--width", str(width)] if width else [])],
                 stdin=subprocess.DEVNULL, capture_output=True, text=True,
                 timeout=120,
             )
@@ -781,7 +797,7 @@ def pick(options, prompt, free=False, single=True):
     return None
 
 
-def prompt_text(prompt):
+def prompt_text(prompt, width=None):
     if not picker():
         log("prompt: no menu installed")
         notify(NO_MENU)
@@ -789,7 +805,8 @@ def prompt_text(prompt):
         return None
     try:
         if picker() == "omarchy":
-            r = subprocess.run(["omarchy-menu-input", prompt],
+            r = subprocess.run(["omarchy-menu-input", prompt,
+                                *(["--width", str(width)] if width else [])],
                                stdin=subprocess.DEVNULL, capture_output=True,
                                text=True, timeout=120)
         else:
@@ -1144,7 +1161,7 @@ def highlight(mode=None):
     cmds = []
     for c in clients:
         cls = c.get("class", "")
-        if not (is_browser_class(cls) or cls.startswith(REMOTE_CLASS)):
+        if not (is_browser_class(cls) or remote_class_parts(cls)):
             continue
         colour = want.get(c["address"])
         # Only the INACTIVE colour. Setting the active one too made a focused
@@ -2249,12 +2266,13 @@ def remote_owners():
 
 
 def remote_owner(cls, pinned):
-    """The ego a remote's terminal (class omaego.<ego>.<remote>) belongs to
-    now. The class is fixed when the window opens, so after the remote is
+    """The ego a remote's terminal (class TUI.omaego.<ego>.<remote>) belongs
+    to now. The class is fixed when the window opens, so after the remote is
     pinned to another ego, the pin wins over the class. None if not a remote."""
-    if not cls.startswith(REMOTE_CLASS):
+    parts = remote_class_parts(cls)
+    if not parts:
         return None
-    _, slug, rid = (cls.split(".", 2) + ["", ""])[:3]
+    slug, rid = parts
     owners = pinned.get(rid, [])
     return slug if slug in owners or not owners else (owners[0] if len(owners) == 1 else slug)
 
@@ -2318,6 +2336,58 @@ echo "serve $(tailscale serve status --json 2>/dev/null | tr -d '\n')"
 """
 
 
+# Why the last probe of a machine came back empty: ("auth", url) when
+# Tailscale SSH wants a login approved in the browser, ("unreachable", "").
+PROBE_WHY = {}
+
+
+def _probe_run(machine, cmd, inp):
+    """Run a probe; its stdout, or None. Tailscale SSH's "additional check"
+    prints a login URL and then waits for it, so the URL is caught as it comes
+    instead of after the timeout."""
+    import threading
+    PROBE_WHY.pop(machine, None)
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+    except Exception:
+        PROBE_WHY[machine] = ("unreachable", "")
+        return None
+    err, out = [], []
+    def drain(stream, into):
+        for line in stream:
+            into.append(line)
+    ts = [threading.Thread(target=drain, args=(p.stdout, out), daemon=True),
+          threading.Thread(target=drain, args=(p.stderr, err), daemon=True)]
+    for t in ts:
+        t.start()
+    try:
+        if inp:
+            p.stdin.write(inp)
+        p.stdin.close()
+    except Exception:
+        pass
+    end = time.monotonic() + 12
+    while p.poll() is None and time.monotonic() < end:
+        url = next((m.group(0) for line in err
+                    for m in [re.search(r"https://login\.tailscale\.com/\S+", line)] if m), None)
+        if url:
+            p.kill()
+            PROBE_WHY[machine] = ("auth", url)
+            return None
+        time.sleep(0.05)
+    if p.poll() is None:
+        p.kill()
+        PROBE_WHY[machine] = ("unreachable", "")
+        return None
+    for t in ts:
+        t.join(1)
+    if p.returncode != 0 and not out:
+        PROBE_WHY[machine] = ("unreachable", "")
+        return None
+    return "".join(out)
+
+
 def probe_machine(machine, me, target=None):
     """What one machine offers: herdr sessions, gateways, serve URLs. Runs the
     probe over ssh in a login shell (herdr is often in ~/.local/bin), or
@@ -2330,10 +2400,8 @@ def probe_machine(machine, me, target=None):
         cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
                target or machine, 'exec "${SHELL:-/bin/sh}" -l']
         inp = script
-    try:
-        out = subprocess.run(cmd, input=inp, capture_output=True, text=True,
-                             timeout=12).stdout
-    except Exception:
+    out = _probe_run(machine, cmd, inp)
+    if out is None:
         return None
     found = {"sessions": [], "ports": [], "serve": {}}
     for line in out.splitlines():
@@ -2374,6 +2442,102 @@ def serve_url_for(machine, port, target=None):
         remember_serve(machine, found["serve"])
         return found["serve"].get(port)
     return hit["urls"].get(str(port))
+
+
+def pinned_remote_keys():
+    return {(r["machine"], r["kind"], r.get("session"), r.get("port"))
+            for _, r in declared_remotes()}
+
+
+def machine_offers(m, f, have):
+    """What machine m offers to pin, from its probe f: rows with a name, a
+    note, and the spec `remote pick --spec` takes. Already pinned is left out."""
+    if not f:
+        return []
+    remember_serve(m, f["serve"])
+    out = []
+    for sess, st in f["sessions"]:
+        if (m, "herdr", sess, None) not in have:
+            out.append({"name": sess, "kind": "herdr",
+                        "note": "stopped" if st == "stopped" else "",
+                        "spec": ["herdr", m, sess]})
+    for port in f["ports"]:
+        label = GATEWAYS.get(port, f"gateway :{port}")
+        if (m, "web", None, port) not in have:
+            out.append({"name": f"{label} web", "kind": "web", "note": "",
+                        "spec": ["web", m, str(port)]})
+        if port in AGENT_TUIS:
+            out.append({"name": f"{label} TUI", "kind": "tui", "note": "",
+                        "spec": ["agent-tui", m, AGENT_TUIS[port]]})
+    out.append({"name": "New herdr session…", "kind": "new", "note": "",
+                "spec": ["herdr-new", m]})
+    out.append({"name": "Any TUI…", "kind": "any", "note": "",
+                "spec": ["tui-on", m]})
+    return out
+
+
+def stream_offers():
+    """`remote pick <ego> --json`: one JSON line per machine as its probe
+    answers, so the panel lists what is known while it waits for the rest,
+    then {"done": true}."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    def emit(obj):
+        print(json.dumps(obj), flush=True)
+    me, peers = tailnet()
+    emit({"machine": me, "here": True, "offers": [], "start": True})
+    # Every machine that could run a TUI, so one missing is never a mystery:
+    # offline ones at once, the rest as their probes answer.
+    cands = [m for m, p in peers.items()
+             if m == me or p["os"] in ("linux", "macOS")]
+    for m in cands:
+        if m != me and not peers[m]["online"]:
+            emit({"machine": m, "here": False, "status": "offline", "offers": []})
+    have = pinned_remote_keys()
+    with ThreadPoolExecutor(8) as ex:
+        futs = {ex.submit(probe_machine, m, me): m
+                for m in cands if m == me or peers[m]["online"]}
+        for fut in as_completed(futs):
+            m = futs[fut]
+            try:
+                f = fut.result()
+            except Exception as e:
+                log(f"remote pick: {m}: {e!r}")
+                f = None
+            why, url = PROBE_WHY.get(m, ("unreachable", "")) if f is None else ("ok", "")
+            emit({"machine": m, "here": m == me, "status": why, "url": url,
+                  "offers": machine_offers(m, f, have)})
+    emit({"done": True})
+    return 0
+
+
+def pin_offer(slug, spec, value=None):
+    """Pin what `remote pick` offered, asking for what the row leaves open
+    unless `value` (the panel asks itself) brings it. Pins only: the card
+    shows it, and opening is a click there."""
+    me_bin = os.environ.get("OMAEGO_BIN", sys.argv[0])
+    add = lambda *a: subprocess.run([me_bin, "remote", "add", slug, *a]).returncode
+    if spec[0] == "herdr-new":
+        sess = (value if value is not None else
+                prompt_text(f"Name of the new herdr session on {spec[1]}") or "").strip()
+        if not sess:
+            return 0
+        return add("herdr", spec[1], slugify(sess))
+    if spec[0] == "agent-tui":
+        return add("tui", spec[1], "--", spec[2])
+    if spec[0] == "tui-on":
+        command = (value if value is not None else
+                   prompt_text(f"What to run on {spec[1]}, e.g. btop", width=560) or "").strip()
+        return add("tui", spec[1], "--", command) if command else 0
+    if spec[0] == "tui-new":
+        txt = (value if value is not None else
+               prompt_text("machine: command, e.g. box: btop", width=560) or "").strip()
+        if ":" not in txt:
+            if value is not None:
+                notify("say where and what: machine: command")
+            return 0
+        m, command = (x.strip() for x in txt.split(":", 1))
+        return add("tui", m.lower(), "--", command)
+    return add(*spec)
 
 
 def tunnel_port(machine, port):
@@ -2679,6 +2843,192 @@ def sync_status(fetch=False):
             "changes": sorted(pending)}
 
 
+FETCH_EVERY = 300   # seconds between background fetches
+
+
+def fetch_in_background():
+    """Fetch the egos repo now and then, without waiting for it, so the bar can
+    show changes made on another device. Never prompts: a remote that needs a
+    password just stays unfetched until you sync by hand."""
+    if not (CONFIG_DIR / ".git").exists():
+        return
+    stamp = CACHE / "last-fetch"
+    try:
+        if time.time() - stamp.stat().st_mtime < FETCH_EVERY:
+            return
+    except OSError:
+        pass
+    remote = (git("remote").stdout.split() or [None])[0]
+    if not remote:
+        return
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
+           "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=10"}
+    subprocess.Popen(["git", "-C", str(CONFIG_DIR), "fetch", "--quiet", remote],
+                     env=env, start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+HISTORY_DAYS = 90
+# Hosts shared by many orgs: a rule there names the org, so history is
+# counted per first path segment (github.com/acme). Only for suggesting rules;
+# a click on such a link is not asked about.
+ORG_PATH_HOSTS = {"github.com", "gitlab.com", "bitbucket.org", "dev.azure.com",
+                  "huggingface.co", "hub.docker.com"}
+_NOT_ORGS = {"", "login", "logout", "settings", "account", "dashboard", "explore",
+             "notifications", "search", "new", "orgs", "organizations", "users",
+             "pulls", "issues", "marketplace", "features", "pricing", "about",
+             "site", "sessions", "signup", "-", "_"}
+# Never a rule: sign-in pages every ego passes through, and local addresses.
+_NO_RULE_HOSTS = {"accounts.google.com", "login.microsoftonline.com", "login.live.com",
+                  "login.microsoft.com", "myaccount.google.com", "localhost"}
+
+
+def shareable_segment(seg):
+    """A first path segment that reads like a name (an org, a workspace), safe
+    to show an agent. Anything that could be an ID or a token is not: UUIDs,
+    long hex or base64-ish runs, digits only, or long mixes of letters and
+    digits. Recurring across several URLs is checked by the caller."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._~-]{0,39}", seg):
+        return False
+    if seg.isdigit() or re.fullmatch(r"[0-9a-fA-F-]{16,}", seg):
+        return False
+    letters, digits = sum(c.isalpha() for c in seg), sum(c.isdigit() for c in seg)
+    if digits and letters and len(seg) > 12 and digits >= 3:
+        return False                  # abc123def456ghi: likely generated
+    if len(seg) >= 16 and not re.search(r"[-_.~]", seg) \
+            and re.search(r"[a-z]", seg) and re.search(r"[A-Z]", seg):
+        return False                  # eyJhbGciOiJIUzI1NiJ9: base64-ish
+    return True
+
+
+def rule_worthy(host):
+    if host in _NO_RULE_HOSTS or host.endswith((".ts.net", ".local", ".localhost")) \
+            or re.match(r"accounts\.google\.[a-z.]+$", host):
+        return False
+    return not re.fullmatch(r"[\d.]+|\[?[0-9a-f:]+\]?", host)
+
+
+def history_hosts(days=HISTORY_DAYS):
+    """{key: {ego slug: visits}} from every ego's browser history, the last
+    `days` days. A key is a host, or host/first-segment where the host is
+    shared by accounts (github.com/<org>, a SharePoint tenant): the shape a
+    rule takes. Only these counts leave this function - no full URLs, titles
+    or query strings, so handing them to an agent says which sites each ego
+    uses, not what was read there."""
+    import sqlite3
+    # Chrome's clock: microseconds since 1601.
+    cutoff = int((time.time() + 11644473600 - days * 86400) * 1_000_000)
+    out, segs = {}, {}
+    for slug, ego in profiles().items():
+        hist = ego["data_dir"] / ego.get("profile_dir", "Default") / "History"
+        if not hist.exists():
+            continue
+        try:
+            # immutable: read while the browser holds its lock, never write.
+            db = sqlite3.connect(f"file:{hist}?immutable=1", uri=True, timeout=2)
+            rows = db.execute("SELECT url, visit_count FROM urls WHERE last_visit_time > ?",
+                              (cutoff,)).fetchall()
+            db.close()
+        except sqlite3.Error as e:
+            log(f"history {slug}: {e}")
+            continue
+        for url, visits in rows:
+            u = urlsplit(url)
+            if u.scheme not in ("http", "https") or not u.hostname:
+                continue
+            host = u.hostname.lower().removeprefix("www.")
+            if not rule_worthy(host):
+                continue
+            scope = account_scope(url)
+            seg = (u.path or "").strip("/").split("/")[0]
+            if scope:
+                key = scope[0]
+            elif host in ORG_PATH_HOSTS:
+                if seg.lower() in _NOT_ORGS or seg.startswith(("_", ".")):
+                    continue
+                key = f"{host}/{seg}"
+            else:
+                key = host
+                if shareable_segment(seg):
+                    sg = segs.setdefault(host, {}).setdefault(seg, {"by": {}, "urls": 0})
+                    sg["by"][slug] = sg["by"].get(slug, 0) + max(1, visits or 0)
+                    sg["urls"] += 1           # distinct URLs: urls holds each once
+            out.setdefault(key, {}).setdefault(slug, 0)
+            out[key][slug] += max(1, visits or 0)
+    # Where a host alone cannot say which ego - several visit it - add its
+    # first path segments, but only ones seen in 3+ different URLs: an org or
+    # workspace recurs on every page under it, a token in a link does not.
+    # And only where it helps: the host really is split (no ego has 90% of
+    # it), and the segment mostly belongs to one ego (80%) - the only kind
+    # that can become a rule. Which profiles you read on x.com stays out.
+    share = lambda by: max(by.values()) / sum(by.values())
+    for host, by_seg in segs.items():
+        if len(out.get(host, {})) < 2 or share(out[host]) >= 0.9:
+            continue
+        common = sorted(((k, v) for k, v in by_seg.items()
+                         if v["urls"] >= 3 and share(v["by"]) >= 0.8),
+                        key=lambda kv: -sum(kv[1]["by"].values()))[:5]
+        for seg, v in common:
+            out[f"{host}/{seg}"] = v["by"]
+    return out
+
+
+def learn_prompt(observed, limit=150):
+    """The agent's brief for suggesting rules: how rules work, the rules you
+    have, where links went, and which ego visits which hosts."""
+    egos = profiles()
+    name = lambda k: egos[k]["name"] if k in egos else k
+    hist = history_hosts()
+    rows = []
+    # A host, then the path segments that split it (when it has any).
+    order = sorted((k for k in hist if "/" not in k or k.split("/")[0] not in hist),
+                   key=lambda k: -sum(hist[k].values()))
+    keys = []
+    for k in order:
+        keys.append(k)
+        keys += sorted((x for x in hist if x.startswith(k + "/") and k in hist and "/" not in k),
+                       key=lambda x: -sum(hist[x].values()))
+    for key, by in ((k, hist[k]) for k in keys):
+        if match_rule(f"https://{key}/x", None):
+            continue                      # a rule already covers it
+        total = sum(by.values())
+        split = ", ".join(f"{name(k)} {n}" for k, n in sorted(by.items(), key=lambda kv: -kv[1]))
+        rows.append(f"{'  ' if '/' in key and key.split('/')[0] in hist else ''}{key}  ({total}: {split})")
+        if len(rows) >= limit:
+            break
+    current = "\n".join(f"{r.get('url') or r.get('match')} -> {r.get('profile') or '(app/rewrite)'}"
+                        for r in load_rules())
+    return (
+        "Help me grow the routing rules of omaego, which keeps my browser identities "
+        "(egos) apart: each ego is its own browser profile. A rule says a URL pattern "
+        "always opens in one ego, wherever I click it. Links without a rule open in "
+        "the ego of the workspace I am on, so rules are only for things that belong "
+        "to ONE context: a customer's tenant (acme.sharepoint.com, acme.atlassian.net), "
+        "a company's own tools, an org on a shared host (github.com/acme/*). Never "
+        "general sites everyone uses (google.com, github.com as a whole, news, docs).\n\n"
+        f"My egos: {', '.join(e['name'] for e in egos.values())}.\n\n"
+        "Existing rules:\n" + (current or "(none)") + "\n\n"
+        "Where links I clicked outside the browser went (from omaego's own log):\n"
+        + ("\n".join(observed) or "(nothing logged yet)") + "\n\n"
+        f"Hosts each ego visited in the last {HISTORY_DAYS} days, from the browsers' "
+        "history - visit counts only, no full URLs - not covered by a rule yet. "
+        "Indented under a host used by several egos: its first path segments "
+        "(only name-like ones that recur), for rules like https://host/<segment>/*:\n"
+        + ("\n".join(rows) or "(no history found)") + "\n\n"
+        "1. Suggest rules: hosts (or host/org paths) visited mostly or only in one "
+        "ego that clearly belong to that context. Group them by ego, give the "
+        "evidence in a few words, and list the ambiguous ones separately.\n"
+        "2. Ask me which to add. Only then run, for each one I approve:\n"
+        "   omaego rule add '<url glob>' '<Ego name>'\n"
+        "   e.g. omaego rule add 'https://acme.atlassian.net/*' 'Acme'\n"
+        "3. Run `omaego rule list` at the end so I see the result.\n"
+        "If a host needs a closer look, ask me before reading more of a browser's "
+        "history; each ego's is the SQLite file History in its profile under "
+        f"{EGO_ROOT}.")
+
+
 def agent_find_icon(slug, name, app_url):
     """Hand the icon hunt to the default omarchy agent.
 
@@ -2880,7 +3230,11 @@ opens on the workspace you are on - never by switching desktops.
   omaego import <src> [name]
                          lift a Chrome-internal profile into its own ego
                          (needs Chrome fully quit)
-  omaego learn [--agent] suggest rules from where links actually went
+  omaego learn [--agent] suggest rules from where links actually went; --agent
+                         hands that and each ego's browsing (hosts and visit
+                         counts, no full URLs) to the default agent, which
+                         suggests rules and adds the ones you approve
+                         (--print shows what it would get)
   omaego sync [--remote <git url>]
                          rewrite desktop entries, relink native messaging hosts;
                          and when ~/.config/omaego is a git repo, keep it (rules,
@@ -3675,7 +4029,7 @@ def main(argv):
         if "--" in raw:
             command = " ".join(raw[raw.index("--") + 1:])
             raw = raw[:raw.index("--")]
-        VALUED = ("--name", "--path", "--url", "--ssh", "--icon")
+        VALUED = ("--name", "--path", "--url", "--ssh", "--icon", "--value")
         opts, pos, i = {}, [], 0
         while i < len(raw):
             if raw[i] in VALUED and i + 1 < len(raw):
@@ -3759,6 +4113,7 @@ def main(argv):
             if any(remote_id(x) == remote_id(r) for x in remotes):
                 print(f"{slug} already has a remote called {r['name']!r}; pick another --name",
                       file=sys.stderr)
+                notify(f"already pinned: {remote_label(r)}")
                 return 1
             if not save_remotes(slug, remotes + [r]):
                 return 1
@@ -3800,58 +4155,73 @@ def main(argv):
             if not rest:
                 print("usage: omaego remote pick <ego>", file=sys.stderr)
                 return 2
-            slug = rest[0]
-            me, peers = tailnet()
-            notify("looking at your machines…")
+            slug, spec = rest[0], (rest[1:] or None) if "--spec" in raw else None
+            title = f"Pin to {(profiles().get(slug) or {}).get('name', slug)}"
+            if "--json" in raw:
+                return stream_offers()
+            if spec:
+                return pin_offer(slug, spec, opts.get("value"))
+            ANY, LOOKING = "Any TUI over ssh…", "Looking at your machines…"
+            # Probing takes seconds. The omarchy menu opens at once with what
+            # needs no probe and a row saying it is looking, its dots stepping
+            # while it looks; the full list then replaces it in place. Each
+            # summon swaps the open menu's rows, so the CLI writes the menu's
+            # payload itself rather than leaving a menu-select per frame.
+            live = picker() == "omarchy"
+            if not live:
+                notify("looking at your machines…")
             from concurrent.futures import ThreadPoolExecutor
-            cands = [m for m, p in peers.items()
-                     if m == me or (p["online"] and p["os"] in ("linux", "macOS"))]
-            with ThreadPoolExecutor(8) as ex:
-                found = dict(zip(cands, ex.map(lambda m: probe_machine(m, me), cands)))
-            have = {(r["machine"], r["kind"], r.get("session"), r.get("port"))
-                    for _, r in declared_remotes()}
-            rows = {}
+            def look():
+                me, peers = tailnet()
+                cands = [m for m, p in peers.items()
+                         if m == me or (p["online"] and p["os"] in ("linux", "macOS"))]
+                with ThreadPoolExecutor(8) as ex:
+                    return me, dict(zip(cands, ex.map(lambda m: probe_machine(m, me), cands)))
+            me, found = None, {}
+            if live:
+                import tempfile
+                tmp = Path(tempfile.mkdtemp(prefix="omaego-menu-"))
+                sel, fin = tmp / "selection", tmp / "done"
+                sel.touch()
+                def frame(n):
+                    payload = {"mode": "select", "prompt": title, "width": 560,
+                               "options": [ANY, LOOKING.rstrip("…") + "." * (n % 3 + 1)],
+                               "selectionFile": str(sel), "doneFile": str(fin)}
+                    subprocess.run(["omarchy-shell", "shell", "summon", "omarchy.menu",
+                                    json.dumps(payload)], capture_output=True)
+                bg = ThreadPoolExecutor(1)
+                done = bg.submit(look)
+                n, shown = 0, 0.0
+                try:
+                    while not done.done():
+                        if fin.exists():
+                            chosen = sel.read_text().strip()
+                            if chosen == ANY:
+                                spec = ["tui-new"]
+                                break
+                            if not chosen.startswith("Looking"):
+                                return 0   # Esc
+                            fin.unlink()   # the looking row: keep looking
+                            sel.write_text("")
+                        if time.monotonic() - shown >= 0.4:
+                            frame(n)
+                            n, shown = n + 1, time.monotonic()
+                        time.sleep(0.05)
+                    if not spec:
+                        me, found = done.result()
+                finally:
+                    bg.shutdown(wait=False)
+                    shutil.rmtree(tmp, ignore_errors=True)
+            else:
+                me, found = look()
+            have = pinned_remote_keys()
+            rows = {ANY: ["tui-new"]}
             for m in sorted(found, key=lambda x: (x != me, x)):
-                f = found[m]
-                if not f:
-                    continue
-                remember_serve(m, f["serve"])
-                for sess, st in f["sessions"]:
-                    if (m, "herdr", sess, None) in have:
-                        continue
-                    label = f"{m}: {sess}" + (" (stopped)" if st == "stopped" else "")
-                    rows[label] = ["herdr", m, sess]
-                for port in f["ports"]:
-                    label = GATEWAYS.get(port, f"gateway :{port}")
-                    if (m, "web", None, port) not in have:
-                        rows[f"{m}: {label} web"] = ["web", m, str(port)]
-                    if port in AGENT_TUIS:
-                        rows[f"{m}: {label} TUI"] = ["agent-tui", m, AGENT_TUIS[port]]
-                rows[f"{m}: new session…"] = ["herdr-new", m]
-            rows["Any TUI over ssh…"] = ["tui-new"]
-            spec = pick(list(rows.items()), f"Pin to {(profiles().get(slug) or {}).get('name', slug)}",
-                        single=False)
+                for r in machine_offers(m, found[m], have):
+                    rows[f"{m}: {r['name']}" + (f" ({r['note']})" if r["note"] else "")] = r["spec"]
             if not spec:
-                return 0
-            if spec[0] == "herdr-new":
-                sess = (prompt_text(f"Name of the new herdr session on {spec[1]}") or "").strip()
-                if not sess:
-                    return 0
-                spec = ["herdr", spec[1], slugify(sess)]
-            elif spec[0] == "agent-tui":
-                me_bin = os.environ.get("OMAEGO_BIN", sys.argv[0])
-                return subprocess.run([me_bin, "remote", "add", slug, "tui", spec[1],
-                                       "--open", "--", spec[2]]).returncode
-            elif spec[0] == "tui-new":
-                txt = (prompt_text("machine: command, e.g. lco-box: btop") or "").strip()
-                if ":" not in txt:
-                    return 0
-                m, command = (x.strip() for x in txt.split(":", 1))
-                me_bin = os.environ.get("OMAEGO_BIN", sys.argv[0])
-                return subprocess.run([me_bin, "remote", "add", slug, "tui", m.lower(),
-                                       "--open", "--", command]).returncode
-            me_bin = os.environ.get("OMAEGO_BIN", sys.argv[0])
-            return subprocess.run([me_bin, "remote", "add", slug, *spec, "--open"]).returncode
+                spec = pick(list(rows.items()), title, single=False, width=560)
+            return pin_offer(slug, spec) if spec else 0
 
         print("usage: omaego remote [list|machines|add|remove|open|pick]", file=sys.stderr)
         return 2
@@ -3970,11 +4340,11 @@ def main(argv):
         return 0
 
     if cmd == "learn":
-        if not ROUTES.exists():
+        if not ROUTES.exists() and "--agent" not in sys.argv:
             print(f"nothing logged yet ({ROUTES})")
             return 0
         seen = {}
-        for line in ROUTES.read_text().splitlines():
+        for line in (ROUTES.read_text().splitlines() if ROUTES.exists() else []):
             try:
                 r = json.loads(line)
             except ValueError:
@@ -4014,19 +4384,16 @@ def main(argv):
             kept.append((hits, total, pat, ego))
 
         if "--agent" in sys.argv[1:]:
+            # The agent gets the browsers' history too (hosts and counts only),
+            # suggests rules and adds the ones you approve.
             lines = [f"{p} -> {e} ({h}/{t} opens)" for h, t, p, e in kept[:40]]
-            current = "\n".join(f"{r.get('url') or r.get('match')} -> {r.get('profile')}"
-                                for r in load_rules())
-            prompt = (
-                "I route links between Chrome profiles (egos) with omaego. "
-                "Below is where links actually went, learned from use, and the "
-                "rules I already have. Suggest `omaego rule add '<glob>' <Ego>` "
-                "lines worth adding, skip anything already covered, and say "
-                "which look ambiguous.\n\nObserved:\n" + "\n".join(lines) +
-                "\n\nExisting rules:\n" + (current or "(none)"))
-            subprocess.Popen(["omarchy", "agent", "prompt", prompt],
-                             start_new_session=True)
-            print(f"handed {len(kept)} observations to the default agent")
+            if "--print" in sys.argv:
+                print(learn_prompt(lines))
+                return 0
+            if not run_agent(learn_prompt(lines), cwd=CONFIG_DIR if CONFIG_DIR.exists() else None):
+                return 1
+            notify("egos: the agent is looking for rules to suggest")
+            print("handed your routes and browsing to the default agent")
             return 0
 
         if not kept:
@@ -4160,6 +4527,7 @@ def main(argv):
     if cmd == "panel":
         # Everything the bar panel renders, in one call - four separate
         # processes per open would be four Chrome-free but still pointless forks.
+        fetch_in_background()
         by_class = all_targets()
         rows = browsers_here()
         here = {c for _, c, _ in rows}
@@ -4233,7 +4601,7 @@ def main(argv):
             "looseRules": [r for r in rules
                            if (r["profile"] or "").lower() not in names],
             "rules": rules,
-            "sync": sync_status(),
+            "sync": sync_status(),   # as of the last fetch, which this keeps fresh
             # Egos in your repo that are not set up on this device.
             "available": [{"slug": k, "name": e["name"], "color": "#" + (e.get("color") or "7aa2f7"),
                            "accounts": e.get("accounts") or [],

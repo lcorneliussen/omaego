@@ -33,6 +33,7 @@ Chrome 154 / omarchy 4.0.4, where the two omarchy bugs below **still stand**.
 | Plugins | Six kinds (`bar`, `bar-widget`, `menu`, `overlay`, `panel`, `service`), all QML, with **no install hook** — a plugin cannot place a binary or claim `x-scheme-handler/https`. The CLI therefore cannot be a plugin; only the bar widget can. Symlinks anywhere inside a plugin folder are refused. The widget is its own repo, `omaego-bar`, and `install.sh --with-plugin` adds it through `omarchy plugin add`. |
 | Quickshell `Component.onCompleted` in a bar widget | Runs **before** the bar injects `settings`, so anything it starts uses defaults — a bare `omaego` instead of the configured command path. Do start-up work after the first successful probe. |
 | Reacting to focus and window changes | Do not poll. `ToplevelManager.activeToplevel` (`Quickshell.Wayland`) updates the instant focus moves, and Hyprland's `onRawEvent` reports `openwindow` / `closewindow` / `movewindow` / `activewindow` / `workspace`; coalesce bursts through a short timer. A web app's `appId` is the app's, not the ego's, so only browser windows match by `appId`. |
+| A terminal window with its own class | Omarchy tags terminals **by class** (`default/hypr/apps/terminals.lua`), and SUPER+C / SUPER+V send Ctrl+Insert / Shift+Insert only to tagged windows. Any other class gets Ctrl+C / Ctrl+V: copy interrupts the program. Remote terminals are `TUI.omaego.<ego>.<remote>`, because `TUI.*` is on that list. |
 | `omarchy webapp install` with no reachable icon | Exits non-zero with empty stderr and installs nothing. Internal hosts often serve no icon, so retry with a generic one. |
 
 ## Hyprland
@@ -60,8 +61,10 @@ Chrome 154 / omarchy 4.0.4, where the two omarchy bugs below **still stand**.
 | `herdr --remote` on a lost connection | Exits **1** and leaves the terminal at a shell, or closes it. There is no reconnect of its own; `omaego-remote` loops on any non-zero exit and treats 0 (detach, quit) as done. A herdr client killed mid-draw leaves its alternate screen behind until the reattach redraws it. |
 | Commands over ssh | `ssh host cmd` runs a non-login shell: `openclaw` in `~/.npm-global/bin`, mise shims, `~/.local/bin` are often not on its PATH. Remote TUIs run as `exec "$SHELL" -lc '<cmd>'`, local ones in `$SHELL -lc` (the bar's environment lacks them too). |
 | Probing a machine over ssh | A non-login shell often lacks `~/.local/bin`, so `herdr` is "not found" on a machine that has it. The probe runs in `"$SHELL" -l` with the script on stdin. |
+| Tailscale SSH "additional check" | A machine can ask for a login to be approved in the browser before ssh goes through. `BatchMode` does not stop it: ssh prints `To authenticate, visit: https://login.tailscale.com/a/…` on stderr and then **waits**, so a probe looks like a slow timeout and the machine silently drops out. The probe watches stderr for that URL and reports the machine as needing approval. |
 | Tailscale machine names | `HostName` is not unique: two Macs can both be `macbook-pro`. Use the MagicDNS label (`DNSName`'s first part), which is. |
-| Omarchy menu width | Rows are cut at about 25 characters. Put what tells rows apart first ("box: compose", not "herdr compose · box"). |
+| Omarchy menu width | Rows are cut at about 25 characters by default. `omarchy-menu-select … -- --width 560` widens it (`pick(…, width=)`); still put what tells rows apart first ("box: compose", not "herdr compose · box"). |
+| Showing a menu while something loads | A second `omarchy-menu-select` while one is open **replaces its rows in place**, and the choice goes to the second caller; the first never returns and has to be terminated. `remote pick` opens a "Looking at your machines…" menu at once this way, since a notification about a slow probe is easily missed. |
 
 ## Icons
 

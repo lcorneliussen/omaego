@@ -303,8 +303,22 @@ hosts that consistently went to one ego:
 
 ```
 omaego learn            # suggestions you can paste
-omaego learn --agent    # hand them to the default omarchy agent to reason about
+omaego learn --agent    # let the default omarchy agent suggest and add rules
 ```
+
+**Suggest rules** in the panel does the second. The agent gets those routes,
+your rules, and what each ego's browser has visited in the last 90 days, as
+hosts and visit counts. Hosts shared by many orgs (GitHub, GitLab, Bitbucket,
+Azure DevOps) are counted per org, such as `github.com/acme`. A host several
+egos use gets its first path segments too, when they tell the egos apart
+(`example.com/acme`), but only ones that read like a name, recur in at least
+three different URLs, and mostly belong to one ego. Anything that looks like an
+ID or a token is left out. It gets no full URLs, page titles or query strings,
+and none of the sign-in pages or local addresses no rule could use. It suggests rules grouped by ego, with the
+evidence and the ambiguous ones apart, and asks which to add. It runs
+`omaego rule add` only for the ones you approve, and asks before reading more
+of a browser's history. `omaego learn --agent --print` shows exactly what it
+would be given.
 
 A host-wide suggestion is withheld when a rule already pins part of that host —
 `bitbucket.org/<customer>/*` existing means `bitbucket.org/*` would quietly
@@ -361,8 +375,12 @@ Its web apps are not installed up front. They show **blurred** on its card, and
 the first click installs one, with its icon from the repo, and opens it.
 Removing a blurred app drops it from the repo.
 
-Nothing is written to the repo behind your back. The panel's **Sync** row says
-how this device and the repo differ ("2 changes here", "1 change to pull").
+Nothing is written to the repo behind your back. When this device and the repo
+differ, a sync mark appears in the bar next to the ego names: `↑2` for changes
+here, `↓1` for changes from another device (fetched in the background every
+few minutes, never with a password prompt), or both. Clicking it syncs. The
+panel's **Sync** row says the same in words ("2 changes here", "1 change to
+pull").
 Clicking it, or running `omaego sync`, does this:
 
 1. It writes this device's egos and apps into `egos.toml` and `icons/`.
@@ -413,7 +431,7 @@ without Tailscale), so one entry opens the right way on every device:
 TUIs run under `omaego-remote`. When the connection drops, it does not leave
 a dead terminal: it says so, waits with backoff (and for the machine to answer
 again), and reattaches. A clean exit, such as detaching from herdr, closes it.
-The terminal's window class is `omaego.<ego>.<name>`, so the bar and the
+The terminal's window class is `TUI.omaego.<ego>.<name>`, so the bar and the
 panel's outlines count it as that ego's window.
 
 A gateway tunnel always uses the same local port for the same machine and
