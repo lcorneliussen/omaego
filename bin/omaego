@@ -3049,6 +3049,31 @@ def agent_find_icon(slug, name, app_url):
     return run_agent(prompt)
 
 
+SYNC_MARK = CACHE / "sync-agent"
+
+
+def sync_agent_busy():
+    """An agent handed a sync is still at work: a process other than this one
+    sits in the config repo, within the hour after the handoff. The agent runs
+    in its own terminal, so this process cannot simply wait for it."""
+    try:
+        if time.time() - SYNC_MARK.stat().st_mtime > 3600:
+            return False
+    except OSError:
+        return False
+    me = os.getpid()
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit() or int(p.name) == me:
+            continue
+        try:
+            cwd = Path(os.readlink(p / "cwd"))
+        except OSError:
+            continue
+        if cwd == CONFIG_DIR or CONFIG_DIR in cwd.parents:
+            return True
+    return False
+
+
 def run_agent(prompt, cwd=None):
     """Hand a prompt to the default omarchy agent, in its own terminal."""
     # omarchy only prints a hint when no default agent is configured, and a
@@ -4438,6 +4463,21 @@ def main(argv):
                                "e.g. git@github.com:you/myomaego.git") or "").strip()
             if not url:
                 return 0
+        # One sync at a time: a second click on the bar's mark while the first
+        # is still fetching, or while its agent works, would start another.
+        import fcntl
+        CACHE.mkdir(parents=True, exist_ok=True)
+        lock = open(CACHE / "sync.lock", "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            notify("egos: already syncing")
+            print("a sync is already running", file=sys.stderr)
+            return 0
+        if sync_agent_busy():
+            notify("egos: the agent is still syncing — finish or close it first")
+            print("an agent is still syncing in its terminal", file=sys.stderr)
+            return 0
         # The local half first, as `sync` always did: desktop entries and the
         # native messaging links. It is what a package upgrade asks for.
         write_desktop_entries()
@@ -4519,6 +4559,7 @@ def main(argv):
             f"~/.local/share/chrome-profiles (logins, cookies) belongs in this repo.")
         if not run_agent(prompt, cwd=CONFIG_DIR):
             return 1
+        SYNC_MARK.touch()
         print(f"handed to the agent: {st['state']}, {st['local']} local, "
               f"{st['ahead']} ahead, {st['behind']} behind")
         notify("egos: the agent is syncing")
