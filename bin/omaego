@@ -3052,16 +3052,16 @@ def agent_find_icon(slug, name, app_url):
 SYNC_MARK = CACHE / "sync-agent"
 
 
-def sync_agent_busy():
-    """An agent handed a sync is still at work: a process other than this one
-    sits in the config repo, within the hour after the handoff. The agent runs
-    in its own terminal, so this process cannot simply wait for it."""
+def sync_agent_pids():
+    """An agent handed a sync is still at work: the processes other than this
+    one that sit in the config repo, within the hour after the handoff. The
+    agent runs in its own terminal, so this process cannot simply wait for it."""
     try:
         if time.time() - SYNC_MARK.stat().st_mtime > 3600:
-            return False
+            return []
     except OSError:
-        return False
-    me = os.getpid()
+        return []
+    me, found = os.getpid(), []
     for p in Path("/proc").iterdir():
         if not p.name.isdigit() or int(p.name) == me:
             continue
@@ -3070,8 +3070,26 @@ def sync_agent_busy():
         except OSError:
             continue
         if cwd == CONFIG_DIR or CONFIG_DIR in cwd.parents:
-            return True
-    return False
+            found.append(int(p.name))
+    return found
+
+
+def window_of(pids):
+    """The address of the window whose process is one of pids or an ancestor
+    of one: the terminal a program runs in."""
+    lineage = set()
+    for pid in pids:
+        while pid > 1 and pid not in lineage:
+            lineage.add(pid)
+            try:
+                stat = Path(f"/proc/{pid}/stat").read_text()
+            except OSError:
+                break
+            pid = int(stat.rsplit(")", 1)[1].split()[1])
+    hits = [c for c in hyprctl("clients") or [] if c.get("pid") in lineage]
+    # The agent's own window over any other terminal in the same line.
+    hits.sort(key=lambda c: c.get("class") != "org.omarchy.agent")
+    return hits[0]["address"] if hits else None
 
 
 def run_agent(prompt, cwd=None):
@@ -4474,8 +4492,15 @@ def main(argv):
             notify("egos: already syncing")
             print("a sync is already running", file=sys.stderr)
             return 0
-        if sync_agent_busy():
-            notify("egos: the agent is still syncing — finish or close it first")
+        busy = sync_agent_pids()
+        if busy:
+            # Bring the agent's window up instead: that is where the sync is.
+            address = window_of(busy)
+            if address:
+                focus(address, confirm=False)
+                notify("egos: the agent is still syncing — here it is")
+            else:
+                notify("egos: the agent is still syncing — finish or close it first")
             print("an agent is still syncing in its terminal", file=sys.stderr)
             return 0
         # The local half first, as `sync` always did: desktop entries and the
