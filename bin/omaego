@@ -330,13 +330,22 @@ def browser_accounts(ego):
             if isinstance(a, dict) and "@" in (a.get("email") or "")]
 
 
+def account_key(address):
+    """What makes two addresses one account: case does not, and Google treats
+    @googlemail.com and @gmail.com as the same mailbox. A profile can report
+    one spelling while egos.toml has the other, and a sync would then add the
+    second back every time."""
+    a = address.strip().lower()
+    return a[:-len("@googlemail.com")] + "@gmail.com" if a.endswith("@googlemail.com") else a
+
+
 def merge_accounts(*lists):
-    """One list of addresses, first spelling and order kept, case-insensitive."""
+    """One list of addresses, first spelling and order kept, one per account."""
     out, seen = [], set()
     for l in lists:
         for a in l or []:
-            if a.lower() not in seen:
-                seen.add(a.lower())
+            if account_key(a) not in seen:
+                seen.add(account_key(a))
                 out.append(a)
     return out
 
@@ -2104,9 +2113,9 @@ def set_accounts(slug, add=(), remove=()):
         ego = profiles()[slug]
         decl[slug] = {"name": ego["name"], "color": ego_color(slug),
                       "accounts": [], "apps": []}
-    drop = {a.lower() for a in remove}
+    drop = {account_key(a) for a in remove}
     decl[slug]["accounts"] = [a for a in merge_accounts(decl[slug]["accounts"], add)
-                              if a.lower() not in drop]
+                              if account_key(a) not in drop]
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     EGOS_FILE.write_text(render_egos(decl))   # the file's order, which is yours
     return decl[slug]["accounts"]
@@ -3543,8 +3552,8 @@ def main(argv):
                 return 2
             now = set_accounts(slug, **({"add": emails} if sub == "add" else {"remove": emails}))
             print(f"{egos[slug]['name']}: {', '.join(now) or 'no accounts'}")
-            signed_in = {a.lower() for a in browser_accounts(here[slug])} if slug in here else set()
-            back = [e for e in emails if sub == "remove" and e.lower() in signed_in]
+            signed_in = {account_key(a) for a in browser_accounts(here[slug])} if slug in here else set()
+            back = [e for e in emails if sub == "remove" and account_key(e) in signed_in]
             if back:
                 print(f"  {', '.join(back)} is still signed in to the browser, so the "
                       f"next sync notes it again (OMAEGO_NO_ACCOUNTS=1 stops that)")
@@ -3562,7 +3571,7 @@ def main(argv):
             return 0
         for s, r in rows.items():
             new = [a for a in r["browser"]
-                   if a.lower() not in {d.lower() for d in r["declared"]}]
+                   if account_key(a) not in {account_key(d) for d in r["declared"]}]
             accts = r["declared"] + [f"{a} (signed in, not synced yet)" for a in new]
             print(f"{egos[s]['name']:<24} {', '.join(accts) or '-'}")
         return 0
