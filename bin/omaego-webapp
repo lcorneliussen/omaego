@@ -26,6 +26,24 @@ for a in "$@"; do
 done
 [ -z "$SLUG" ] && SLUG=$(cat "$ROOT/.default" 2>/dev/null)
 
+# A web app often starts an ego at login, where the launching context can lack
+# the session's runtime vars. Chrome then comes up unable to reach the PipeWire
+# socket (enumerates no audio devices, so a mic is "not found") or the keyring
+# (cannot decrypt cookies, so the ego looks signed out), while still drawing a
+# window - so nothing says it is wrong. Fill any missing var from the systemd
+# user manager, which always holds the session's values. A no-op when set.
+# XDG_RUNTIME_DIR first: the PipeWire socket and the user bus live under it, and
+# `systemctl --user` needs it to reach the user manager at all.
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR
+for _v in WAYLAND_DISPLAY DISPLAY DBUS_SESSION_BUS_ADDRESS; do
+  if [ -z "${!_v:-}" ]; then
+    _val=$(systemctl --user show-environment 2>/dev/null | sed -n "s/^$_v=//p")
+    [ -n "$_val" ] && export "$_v=$_val"
+  fi
+done
+: "${DBUS_SESSION_BUS_ADDRESS:=unix:path=$XDG_RUNTIME_DIR/bus}"
+export DBUS_SESSION_BUS_ADDRESS
+
 # Each ego runs in its own browser; omaego knows which. Without an ego it is
 # omarchy's default browser.
 ENGINE=$("$(dirname "$(readlink -f "$0")")/omaego" engine command $SLUG 2>/dev/null)
