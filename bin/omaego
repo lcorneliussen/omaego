@@ -2273,6 +2273,79 @@ GATEWAYS = {18789: "OpenClaw", 9119: "Hermes"}
 AGENT_TUIS = {18789: "openclaw tui", 9119: "hermes --tui"}
 REMOTE_PREFIX = "omaego-remote-"
 SERVE_CACHE = Path.home() / ".cache/omaego/serve.json"
+# Every ssh omaego spawns shares one master per machine. A fresh handshake
+# makes the agent SIGN, and an agent that asks for approval per signature
+# (1Password's, `ssh-add -c`, a FIDO key) raises a dialog for each one -
+# BatchMode does not stop it. Multiplexed, one approval covers the probe, the
+# terminal it opens and the gateway tunnel instead of one per connection.
+# `%C` hashes host/port/user, which keeps the socket path inside the sockaddr
+# length limit. Without the keepalives a master to a machine that later leaves
+# the tailnet goes stale and the next connection hangs instead of failing.
+# `herdr --remote` manages its own master and is left alone.
+SSH_MUX_DIR = Path.home() / ".cache/omaego/ssh"
+MUX_PERSIST = 600   # ControlPersist, seconds
+_SSH_CFG = {}
+
+
+def ssh_config(target):
+    """The effective ssh config for a destination, as `ssh -G` resolves it.
+    Paths come back expanded, `%C` and `~` included."""
+    if target not in _SSH_CFG:
+        cfg = {}
+        try:
+            r = subprocess.run(["ssh", "-G", target], capture_output=True,
+                               text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                k, _, v = line.partition(" ")
+                cfg.setdefault(k, v)
+        except Exception:
+            pass
+        _SSH_CFG[target] = cfg
+    return _SSH_CFG[target]
+
+
+def ssh_master(target):
+    """This destination's master socket and whether it is omaego's to ask for:
+    (path, ours). A user whose own ssh config already multiplexes the host
+    keeps their master - opening a second one beside it would mean a second
+    approval for the same machine, the very thing being avoided."""
+    cfg = ssh_config(target)
+    theirs = cfg.get("controlpath", "none")
+    if theirs != "none" and cfg.get("controlmaster", "false") not in ("false", "no"):
+        return theirs, False
+    try:
+        SSH_MUX_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError:
+        return None, False
+    return f"{SSH_MUX_DIR}/%C", True
+
+
+def ssh_mux(target):
+    """The multiplexing options for an ssh command line to a destination."""
+    path, ours = ssh_master(target)
+    if ours:
+        return ["-o", "ControlMaster=auto", "-o", f"ControlPath={path}",
+                "-o", f"ControlPersist={MUX_PERSIST}",
+                "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
+    if not path:
+        return []
+    # Their socket, so nothing about the path - but a master that does not
+    # persist is gone the moment the connection that made it ends, and the
+    # signature with it. That one option is safe to add on top of theirs.
+    if ssh_config(target).get("controlpersist", "no") in ("no", "false", "0"):
+        return ["-o", f"ControlPersist={MUX_PERSIST}"]
+    return []
+
+
+def ssh_master_live(target):
+    """Whether a master already covers this machine, so the next connection
+    reuses it and the agent is never asked to sign."""
+    path, _ = ssh_master(target)
+    if not path:
+        return False
+    r = subprocess.run(["ssh", "-O", "check", "-o", f"ControlPath={path}", target],
+                       capture_output=True, text=True)
+    return r.returncode == 0
 
 
 def tailnet():
@@ -2384,12 +2457,20 @@ echo "serve $(tailscale serve status --json 2>/dev/null | tr -d '\n')"
 """
 
 
+# How long a probe may take on a cold connection, where the handshake can be
+# waiting on an agent approval. Warm ones get 12s, see probe_machine.
+COLD_PROBE = 90
+# How long `remote pick`'s menu keeps saying it is looking. Shorter than
+# COLD_PROBE on purpose: the probe is left to finish in the background.
+MENU_PATIENCE = 15
+
+
 # Why the last probe of a machine came back empty: ("auth", url) when
 # Tailscale SSH wants a login approved in the browser, ("unreachable", "").
 PROBE_WHY = {}
 
 
-def _probe_run(machine, cmd, inp):
+def _probe_run(machine, cmd, inp, limit=12):
     """Run a probe; its stdout, or None. Tailscale SSH's "additional check"
     prints a login URL and then waits for it, so the URL is caught as it comes
     instead of after the timeout."""
@@ -2415,7 +2496,7 @@ def _probe_run(machine, cmd, inp):
         p.stdin.close()
     except Exception:
         pass
-    end = time.monotonic() + 12
+    end = time.monotonic() + limit
     while p.poll() is None and time.monotonic() < end:
         url = next((m.group(0) for line in err
                     for m in [re.search(r"https://login\.tailscale\.com/\S+", line)] if m), None)
@@ -2441,14 +2522,25 @@ def probe_machine(machine, me, target=None):
     probe over ssh in a login shell (herdr is often in ~/.local/bin), or
     directly on this machine."""
     script = PROBE % " ".join(str(p) for p in GATEWAYS)
+    warm = True
     if machine == me:
         cmd = ["sh", "-c", script]
         inp = None
     else:
-        cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
-               target or machine, 'exec "${SHELL:-/bin/sh}" -l']
+        dest = target or machine
+        # Warm, the master answers in milliseconds, so a slow probe means a
+        # slow machine and nothing should wait on it. Cold, the handshake can
+        # be sitting on an agent approval a human has yet to click: cutting
+        # that off is what reported the machine unreachable and kept it so,
+        # since the connection that would have made the master never finished.
+        # ConnectTimeout stays short either way - it bounds reaching the
+        # machine, not signing in, so a machine that is not there still drops
+        # out in seconds rather than holding the menu for the whole cap.
+        warm = ssh_master_live(dest)
+        cmd = ["ssh", "-T", *ssh_mux(dest), "-o", "BatchMode=yes",
+               "-o", "ConnectTimeout=4", dest, 'exec "${SHELL:-/bin/sh}" -l']
         inp = script
-    out = _probe_run(machine, cmd, inp)
+    out = _probe_run(machine, cmd, inp, 12 if warm else COLD_PROBE)
     if out is None:
         return None
     found = {"sessions": [], "ports": [], "serve": {}}
@@ -2464,6 +2556,75 @@ def probe_machine(machine, me, target=None):
         elif parts[0] == "serve":
             found["serve"] = serve_urls(parts[1] if len(parts) == 2 else "", machine)
     return found
+
+
+WARM_EVERY = 240   # seconds between warms; well inside ControlPersist
+
+
+def warm_masters():
+    """Open the ssh master to every online machine, so that the first
+    signature an agent wants approved happens with nothing on screen waiting
+    to be dismissed. The approval dialog is an ordinary toplevel window and
+    the omarchy menu dismisses on focus loss, so the same dialog raised from
+    inside `remote pick` takes the menu with it. Returns what each machine
+    did, for `remote warm`."""
+    from concurrent.futures import ThreadPoolExecutor
+    me, peers = tailnet()
+    targets = {}
+    for _, r in declared_remotes():
+        m = r["machine"]
+        if m != me and peers.get(m, {}).get("online", True):
+            targets[m] = r.get("ssh") or m
+    # Machines with nothing pinned yet are what `remote pick` is about to
+    # probe, so they are worth a master too.
+    for m, pr in peers.items():
+        if m != me and pr["online"] and pr["os"] in ("linux", "macOS"):
+            targets.setdefault(m, m)
+
+    def warm(item):
+        machine, dest = item
+        if ssh_master_live(dest):
+            return machine, "live"
+        # The master this leaves behind is what everything after it reuses.
+        # Nothing is captured: the master ssh forks into the background with
+        # the fds it was given, and reading a pipe it holds would wait out its
+        # whole ControlPersist rather than this connection.
+        cmd = ["ssh", "-n", "-T", *ssh_mux(dest), "-o", "BatchMode=yes",
+               "-o", "ConnectTimeout=10", dest, "true"]
+        try:
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=COLD_PROBE)
+        except subprocess.TimeoutExpired:
+            return machine, "timeout"
+        except Exception as e:
+            log(f"remote warm: {machine}: {e!r}")
+            return machine, "failed"
+        return machine, "warmed" if r.returncode == 0 else "failed"
+
+    if not targets:
+        return {}
+    with ThreadPoolExecutor(8) as ex:
+        return dict(ex.map(warm, sorted(targets.items())))
+
+
+def warm_in_background():
+    """Warm from `omaego panel`, which the bar runs when its panel opens: the
+    masters are then usually already there by the time a card's "Add session
+    or gateway" probes anything. Warming can always miss, which is why the
+    cold probe is also given room for an approval."""
+    stamp = CACHE / "last-warm"
+    try:
+        if time.time() - stamp.stat().st_mtime < WARM_EVERY:
+            return
+    except OSError:
+        pass
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    me = os.environ.get("OMAEGO_BIN", shutil.which("omaego") or sys.argv[0])
+    subprocess.Popen([me, "remote", "warm"], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
 
 
 def remember_serve(machine, urls):
@@ -2623,7 +2784,10 @@ def run_tunnel(target, port, local, idle_limit=600):
     backoff, idle = 2, 0
     while idle < idle_limit:
         p = subprocess.Popen(
-            ["ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
+            # Its own keepalives, not just the ones ssh_mux may bring: this
+            # loop reconnects on a drop, and only a keepalive notices one.
+            ["ssh", "-N", *ssh_mux(target), "-o", "BatchMode=yes",
+             "-o", "ExitOnForwardFailure=yes",
              "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
              "-L", f"127.0.0.1:{local}:127.0.0.1:{port}", target],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2661,7 +2825,8 @@ def remote_command(r, me):
     cmd = r.get("command") or 'exec "$SHELL" -l'
     if local:
         return [os.environ.get("SHELL") or "/bin/bash", "-lc", cmd]
-    return ["ssh", "-t", target, f'exec "${{SHELL:-/bin/sh}}" -lc {shlex.quote(cmd)}']
+    return ["ssh", "-t", *ssh_mux(target), target,
+            f'exec "${{SHELL:-/bin/sh}}" -lc {shlex.quote(cmd)}']
 
 
 def open_remote(slug, r):
@@ -3346,6 +3511,9 @@ opens on the workspace you are on - never by switching desktops.
                          to an ego (--ssh user@host, --icon, --open)
   omaego remote list|open|remove <ego> <name>    pinned sessions and gateways
   omaego remote pick <ego>        choose from what your machines offer
+  omaego remote warm [--json]     open the ssh master to each online machine,
+                         so a key that wants approving is approved here and not
+                         under a menu (the panel does this by itself)
   omaego rule list       the routing rules
   omaego rule add <url-glob> <ego> [--app]
   omaego app list        web apps you can pin to an ego
@@ -3389,10 +3557,12 @@ Rules: ~/.config/omaego/rules.toml
 # Read-only queries the bar widget polls several times a minute. Logging them
 # would churn the routing history out of the log's size cap within the hour.
 QUIET = {"space", "here", "list", "default", "engine", "panel", "highlight", "--help", "-h"}
+# The same, for what the panel starts by itself.
+QUIET_PAIRS = {("remote", "warm")}
 
 
 def main(argv):
-    if not (argv and argv[0] in QUIET):
+    if not (argv and (argv[0] in QUIET or tuple(argv[:2]) in QUIET_PAIRS)):
         log(f"argv={argv}")
 
     # Callers probe browsers with --help (omarchy-launch-browser greps it to
@@ -4138,6 +4308,20 @@ def main(argv):
             target, port, local = rest[0], int(rest[1]), int(rest[2])
             return run_tunnel(target, port, local)
 
+        if sub == "warm":
+            # Establish the ssh masters with nothing on screen. `omaego panel`
+            # does this in the background; by hand it is also the answer when
+            # a machine has dropped out of `remote pick`.
+            did = warm_masters()
+            if want_json:
+                print(json.dumps({"machines": did}))
+                return 0
+            if not did:
+                print("no machines to warm")
+            for m, st in sorted(did.items()):
+                print(f"  {m:<24} {st}")
+            return 0
+
         if sub in ("list", "ls"):
             me, peers = tailnet()
             rows = [{"ego": k, "id": remote_id(r), **r,
@@ -4283,8 +4467,21 @@ def main(argv):
                 bg = ThreadPoolExecutor(1)
                 done = bg.submit(look)
                 n, shown = 0, 0.0
+                giveup = time.monotonic() + MENU_PATIENCE
                 try:
                     while not done.done():
+                        if time.monotonic() > giveup:
+                            # A cold connection can be sitting on a key
+                            # approval, and that dialog has taken this menu
+                            # with it already. Stop re-summoning the menu -
+                            # reopening it would pull the focus back off the
+                            # dialog, so the approval could never be given -
+                            # and leave the probes running: they finish on
+                            # their own and leave the masters behind, so the
+                            # next open needs no signature and answers at once.
+                            notify("still looking at your machines - approve "
+                                   "the key if it asks, then try again")
+                            return 0
                         if fin.exists():
                             chosen = sel.read_text().strip()
                             if chosen == ANY:
@@ -4314,7 +4511,8 @@ def main(argv):
                 spec = pick(list(rows.items()), title, single=False, width=560)
             return pin_offer(slug, spec) if spec else 0
 
-        print("usage: omaego remote [list|machines|add|remove|open|pick]", file=sys.stderr)
+        print("usage: omaego remote [list|machines|add|remove|open|pick|warm]",
+              file=sys.stderr)
         return 2
 
     if cmd == "setup":
@@ -4642,6 +4840,7 @@ def main(argv):
         # Everything the bar panel renders, in one call - four separate
         # processes per open would be four Chrome-free but still pointless forks.
         fetch_in_background()
+        warm_in_background()
         by_class = all_targets()
         rows = browsers_here()
         here = {c for _, c, _ in rows}

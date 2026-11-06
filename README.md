@@ -439,6 +439,16 @@ port, so the gateway's origin, and the login it stores, stay the same. The
 tunnel reconnects by itself and closes after ten idle minutes. Nothing new is
 exposed on the tailnet.
 
+Every ssh omaego makes to a machine shares one connection: the probe, the
+terminal it opens and the gateway tunnel ride the same master. On a machine
+whose key wants approving per signature — 1Password's agent, `ssh-add -c`, a
+FIDO key — that is one approval instead of one per connection, and the panel
+warms the masters when it opens, so the approval comes up with nothing waiting
+on it rather than from inside a menu, which the dialog would dismiss.
+`omaego remote warm` does it by hand, and is the answer if a machine has
+dropped out of **Add session or gateway**. If your `~/.ssh/config` already sets
+`ControlMaster`, omaego uses your master and adds nothing of its own.
+
 **Add session or gateway** on a card looks at your machines that are online
 and offers what they have: their herdr sessions by name, a new herdr session,
 any TUI over ssh, and an OpenClaw (18789) or Hermes (9119) gateway answering on
@@ -461,6 +471,7 @@ omaego remote add acme tui box --name btop -- btop
 omaego remote list                             # every remote, and where it is
 omaego remote open work "herdr compose"
 omaego remote remove work "herdr compose"
+omaego remote warm                             # open the ssh master to each machine
 ```
 
 In `egos.toml` a remote is one table under its ego:
