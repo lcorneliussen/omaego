@@ -77,7 +77,7 @@ Everything, in one chain pinned to a reviewed commit:
 ```bash
 git clone https://github.com/lcorneliussen/omaego && \
   cd omaego && \
-  git checkout 098befbc02deed2b7c914f501f45439c172eaa5c && \
+  git checkout 1812ab213b8998c9dbf18e718dd1baf2819623b4 && \
   ./install.sh --with-plugin && \
   omaego setup && \
   omarchy restart shell

@@ -1,6 +1,6 @@
 # Maintainer: Lars Corneliussen <lcorneliussen@users.noreply.github.com>
 pkgname=omaego
-pkgver=0.4.5
+pkgver=0.4.6
 pkgrel=1
 pkgdesc="Keep work, private and customer contexts apart in one browser: per-ego Chrome profiles with workspace-aware link routing"
 arch=('any')
@@ -15,7 +15,7 @@ optdepends=(
 )
 install=omaego.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('c07b9e3860df7341f71932e977246d694db63ecdeaeefc04e2076823fc5afdd2')
+sha256sums=('aacbb4af7228b37a2a96ea2a64c1e637b43bd6441520210d0961a2a55a355fdd')
 
 package() {
   cd "$srcdir/$pkgname-$pkgver"
