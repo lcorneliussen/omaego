@@ -36,6 +36,7 @@ Chrome 154 / omarchy 4.0.4, where the two omarchy bugs below **still stand**.
 | Reacting to focus and window changes | Do not poll. `ToplevelManager.activeToplevel` (`Quickshell.Wayland`) updates the instant focus moves, and Hyprland's `onRawEvent` reports `openwindow` / `closewindow` / `movewindow` / `activewindow` / `workspace`; coalesce bursts through a short timer. A web app's `appId` is the app's, not the ego's, so only browser windows match by `appId`. |
 | A terminal window with its own class | Omarchy tags terminals **by class** (`default/hypr/apps/terminals.lua`), and SUPER+C / SUPER+V send Ctrl+Insert / Shift+Insert only to tagged windows. Any other class gets Ctrl+C / Ctrl+V: copy interrupts the program. Remote terminals are `TUI.omaego.<ego>.<remote>`, because `TUI.*` is on that list. |
 | `omarchy webapp install` with no reachable icon | Exits non-zero with empty stderr and installs nothing. Internal hosts often serve no icon, so retry with a generic one. |
+| `omarchy agent prompt` | A chain of execs ending in `setsid uwsm-app`, which hands the terminal to the systemd user manager and **returns success whatever becomes of it** - and the error, if any, goes to the caller's stderr, which a launch from the bar has nobody reading. A `Popen` that did not raise is therefore no evidence that an agent started: a sync claimed "the agent is syncing" for days with no agent anywhere. `run_agent` waits for an `org.omarchy.agent` window to appear instead. |
 
 ## Hyprland
 
@@ -68,6 +69,14 @@ Chrome 154 / omarchy 4.0.4, where the two omarchy bugs below **still stand**.
 | Tailscale machine names | `HostName` is not unique: two Macs can both be `macbook-pro`. Use the MagicDNS label (`DNSName`'s first part), which is. |
 | Omarchy menu width | Rows are cut at about 25 characters by default. `omarchy-menu-select … -- --width 560` widens it (`pick(…, width=)`); still put what tells rows apart first ("box: compose", not "herdr compose · box"). |
 | Showing a menu while something loads | A second `omarchy-menu-select` while one is open **replaces its rows in place**, and the choice goes to the second caller; the first never returns and has to be terminated. `remote pick` opens a "Looking at your machines…" menu at once this way, since a notification about a slow probe is easily missed. |
+
+## The egos repo
+
+| Thing | Reality |
+|---|---|
+| `egos.toml` is **generated** | Every `omaego sync` writes it from this machine (`export_repo`), so a value the file holds that omaego would write differently comes back changed on the next status - on every machine, for ever. It bit the account list: @googlemail.com and @gmail.com are one account, and a sync agent resolving a rebase by "what either side added stays" put the second spelling back as fast as the next export dropped it. A resolution that disagrees with omaego loses: resolve, then `omaego sync --export`, and commit what that rewrites. |
+| "Always some change" on every machine | The bar's mark counts `export_repo(write=False)`, not `git status` - a machine with a committed, pushed, clean repo still shows a change when its own state disagrees with the file. So the thing to look at is not git but `omaego sync --status`, and the diff it means is what `omaego sync --export` would write. |
+| Version skew between machines | The repo is one file written by whatever omaego each machine runs. A machine on an older release writes what its omaego knows, which a newer one then rewrites - the same ping-pong, with no conflict and nothing in the log. Keep the machines on one release before chasing a sync that will not settle. |
 
 ## Icons
 

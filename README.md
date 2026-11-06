@@ -389,6 +389,10 @@ Clicking it, or running `omaego sync`, does this:
    omarchy agent**, in a terminal. The agent commits with a message that says
    what changed, rebases, resolves conflicts (and asks you when both sides
    changed the same thing), pushes, and runs `omaego apply --prune`.
+4. Last it runs `omaego sync --export` again and commits whatever that
+   rewrites. `egos.toml` is generated, so a resolution that disagrees with
+   what omaego writes has to give way - otherwise that one line comes back as
+   a change on every device, after every sync, for ever.
 
 The order in `egos.toml` is the order on the panel, on every device: the
 cards, and each card's apps and remotes. Drag a card by its name, or an app or
@@ -403,6 +407,7 @@ over your edit.
 
 ```bash
 omaego sync --status [--fetch]   # drift, read-only: clean, local, behind, diverged
+omaego sync --export             # write this device into the repo, nothing else
 omaego apply [--prune]           # make this device's egos match egos.toml
 omaego app open acme Teams       # launch, installing a declared app first
 ```

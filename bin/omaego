@@ -3308,8 +3308,29 @@ def window_of(pids):
     return hits[0]["address"] if hits else None
 
 
+AGENT_CLASS = "org.omarchy.agent"
+AGENT_WAIT = 12   # seconds to give the launcher chain to draw a window
+
+
+def agent_windows():
+    """Every open agent terminal, by window address. None when the compositor
+    cannot be asked, where the answer is unknown rather than "none"."""
+    cs = hyprctl("clients")
+    if cs is None:
+        return None
+    return {c["address"] for c in cs if c.get("class") == AGENT_CLASS}
+
+
 def run_agent(prompt, cwd=None):
-    """Hand a prompt to the default omarchy agent, in its own terminal."""
+    """Hand a prompt to the default omarchy agent, in its own terminal.
+
+    Returns once the agent's window is up, or False if it never came. Waiting
+    is the point: `omarchy agent prompt` is a chain of execs ending in `setsid
+    uwsm-app`, which hands the terminal to the systemd user manager and returns
+    success whatever becomes of it, so a Popen that did not raise is no
+    evidence that anything started. Claiming a handoff that never happened is
+    how a sync went quiet for days while every machine kept reporting changes.
+    """
     # omarchy only prints a hint when no default agent is configured, and a
     # Popen succeeds either way - so check before claiming the handoff worked.
     if not (Path.home() / ".config/omarchy/defaults/agent").exists():
@@ -3317,12 +3338,25 @@ def run_agent(prompt, cwd=None):
         print("no default agent configured; run: omarchy default agent <name>",
               file=sys.stderr)
         return False
+    before = agent_windows()
     try:
         subprocess.Popen(["omarchy", "agent", "prompt", prompt],
                          start_new_session=True, cwd=cwd)
-        return True
-    except Exception:
+    except Exception as e:
+        log(f"run_agent: {e!r}")
         return False
+    if before is None:
+        return True
+    end = time.monotonic() + AGENT_WAIT
+    while time.monotonic() < end:
+        time.sleep(0.4)
+        now = agent_windows()
+        if now is None or now - before:
+            return True
+    notify("the agent did not start — run the command in a terminal to see why")
+    print(f"no agent window appeared within {AGENT_WAIT}s; run it by hand: "
+          "omarchy agent prompt '<the prompt above>'", file=sys.stderr)
+    return False
 
 
 def app_add(slug, keys, name_tpl=None, url=None, display=None, want_rule=False,
@@ -3500,6 +3534,8 @@ opens on the workspace you are on - never by switching desktops.
                          egos, web apps) in sync with your private remote: pull,
                          and hand commits and merges to the default agent
   omaego sync --status [--fetch] [--json]   drift between repo and machine
+  omaego sync --export   write this machine's state into egos.toml and icons/,
+                         without pulling, committing or asking an agent
   omaego apply [--prune] make this machine match egos.toml
   omaego app open <ego> "<app>"   launch, installing a declared app first
   omaego move ego <slug> --before <slug> | --end
@@ -4722,6 +4758,19 @@ def main(argv):
                 for c in st.get("changes", []):
                     print(f"  {c}")
             return 0
+        if "--export" in raw:
+            # Write this machine's state into the repo, and nothing else: no
+            # pull, no commit, no agent. egos.toml is generated, so a merge
+            # resolution that kept both sides of something omaego normalises -
+            # two spellings of one account, say - is undone by the next export.
+            # Whoever resolved the merge runs this and commits the result, or
+            # every machine reports that same change for ever.
+            changed = export_repo(write=True)
+            for c in changed:
+                print(f"  {c}")
+            print(f"{len(changed)} file(s) written from this machine"
+                  if changed else "egos.toml already matches this machine")
+            return 0
         url = next((raw[i + 1] for i, a in enumerate(raw)
                     if a == "--remote" and i + 1 < len(raw)), None)
         if "--setup" in raw and not url:
@@ -4741,7 +4790,11 @@ def main(argv):
             notify("egos: already syncing")
             print("a sync is already running", file=sys.stderr)
             return 0
-        busy = sync_agent_pids()
+        # An agent's terminal stays open after its work is done - the agent
+        # sits at its prompt - so a process in the repo is not proof there is
+        # work left. Checked against the repo first, or the hour after a sync
+        # that finished in a minute answers every click with "still syncing".
+        busy = sync_agent_pids() if sync_status()["state"] != "clean" else []
         if busy:
             # Bring the agent's window up instead: that is where the sync is.
             address = window_of(busy)
@@ -4827,8 +4880,15 @@ def main(argv):
             f"ask me. egos.toml and rules.toml must stay valid TOML - check each "
             f"with: python3 -c 'import tomllib,sys; tomllib.load(open(sys.argv[1],\"rb\"))' FILE\n"
             f"3. Push (with -u if the branch has no upstream yet).\n"
-            f"4. Run `omaego apply --prune` so this machine matches the repo, then "
-            f"`omaego sync --status`, which should print \"clean\".\n\n"
+            f"4. Run `omaego apply --prune` so this machine matches the repo, "
+            f"then `omaego sync --export`. egos.toml is generated, so that "
+            f"rewrites it from this machine: anything it changes is omaego "
+            f"normalising what the merge left - the two spellings of one "
+            f"account being the usual one - so commit and push that too, and "
+            f"never put the old value back.\n"
+            f"5. `omaego sync --status` must then print \"clean\". If it does "
+            f"not, say which file is still pending and why - a machine that "
+            f"keeps reporting a change is the bug this step exists to catch.\n\n"
             f"Work only inside {CONFIG_DIR}. Nothing from "
             f"~/.local/share/chrome-profiles (logins, cookies) belongs in this repo.")
         if not run_agent(prompt, cwd=CONFIG_DIR):
